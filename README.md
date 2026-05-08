@@ -9,7 +9,7 @@ Quantitative detection of multicolored bioluminescence in plants
 
 
 
-# Installation
+# 🫖 Installation
 
 1. Click the green **Code** button in the top-right corner of the repository page and select **Download ZIP**.
 
@@ -22,7 +22,7 @@ Quantitative detection of multicolored bioluminescence in plants
 
 ---
 
-## Running the Program
+## 🫖 Running the Program
 
 5. Open **Command Prompt** in Windows:
    - Press `Windows + R`

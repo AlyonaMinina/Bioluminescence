@@ -1,6 +1,5 @@
 # Bioluminescence measurement
-Quantitative detection of multicolored bioluminescence in plants
-
+This is a web-based Graphical User Interface (GUI) for quick and convenient quantitative detection of multicolored bioluminescence in plants. The GUI is designed to process images acquired using our Biolum imaging system based on a Nikon D800 camera controlled by a Raspberry Pi 4.
 
 <p align="center">
    <img src="Previews/Measurment%20tab%20preview.png" width="80%" />
@@ -9,7 +8,8 @@ Quantitative detection of multicolored bioluminescence in plants
 
 
 
-# 🫖 Installation
+<details>
+<summary><h1>🫖 Installation</h1></summary>
 
 1. Click the green **Code** button in the top-right corner of the repository page and select **Download ZIP**.
 
@@ -19,10 +19,11 @@ Quantitative detection of multicolored bioluminescence in plants
    [Python Downloads](https://www.python.org/downloads/?utm_source=chatgpt.com)
 
 4. During installation, make sure to check **"Add Python to PATH"**.
+</details>
 
----
 
-## 🫖 Running the Program
+<details>
+<summary><h1>🫖 Starting the GUI </h1></summary>
 
 5. Open **Command Prompt** in Windows:
    - Press `Windows + R`
@@ -52,9 +53,11 @@ python biolum_analysis.py
 ```text
 http://localhost:5001
 ```
----
 
-# Features and Step-by-Step Instructions
+</details>
+<details>
+<summary><h1> 👣Features and Step-by-Step Instructions</h1></summary>
+
 
 ## Preparing Files
 
@@ -143,3 +146,4 @@ Sample_01.jpg
 
 - Images can be reopened for additional analysis rounds.
 - Previously saved ROIs can be reloaded, adjusted, and re-measured.
+</details>

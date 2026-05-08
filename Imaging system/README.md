@@ -25,9 +25,11 @@ The system comprises:
 
 ---
 
-<H2>🫖 Running the GUI as a Background Service</H2>
-<details>
-<summary> To have continous access to the GUI, it has to automatically start and run continuously on the Raspberry Pi:</summary>
+
+
+<details> <summary> <H2>🫖 Accessing the GUI </H2> </summary>
+
+To have continous access to the GUI, it has to automatically start and run continuously on the Raspberry Pi:
 
 ### 1. Copy the `biolum_controller.service` file to the Raspberry Pi
 
@@ -52,10 +54,6 @@ sudo systemctl enable controller
 
 sudo systemctl start controller
 ```
-
-</details>
-
-<details> <summary> <H2>🫖 Accessing the GUI </H2> </summary>
 
 1. Connect a laptop to the Raspberry Pi hotspot/network.
 2. Determine the Raspberry Pi IP address (RPI_IP):

@@ -1,5 +1,13 @@
 # Bioluminescence measurement
-Quantitative detection of multicolored bioluminescence (for now in plants)
+Quantitative detection of multicolored bioluminescence in plants
+
+
+<p align="center">
+   <img src="Previews/Measurment%20tab%20preview.png" width="80%" />
+   <img src="Previews/Analysis%20tab%20preview.png" width="80%" />
+</p>
+
+
 
 # Installation
 
@@ -71,7 +79,7 @@ Sample_01.jpg
 - Click a day or bioluminescence file to load it into the image viewer.
 - Load the matching day/bioluminescence pair.
 - NB! The GUI only allows files with the same sample name to be paired, preventing mix-ups.
-
+- To load a different sample, clear the current images from the viewer by clicking the **X Clear** buttons located in the top-right corner of each image.
 ---
 
 ## Drawing and Managing ROIs
@@ -112,7 +120,7 @@ Sample_01.jpg
 
 # Analysis Tab
 
-- The **Analysis** tab automatically generates box plots for:
+- After you clicked **Save Results**, the **Analysis** tab automatically generates box plots for:
   - Mean integrated density values
   - Background-subtracted signals
 

@@ -1,15 +1,16 @@
-# 🤖 Imaging System Controller
+# Imaging System Controller
 
-This folder contains the Raspberry Pi–based imaging controller and locally hosted web GUI for the imaging system.
+Biolum system is designed for imaging of bioluminescence in plants.
 
-The system is built around:
-- Nikon D800 camera
-- Raspberry Pi 4
+The system comprises:
+- Raspberry Pi 4 + PSU
+- Nikon D800 camera (kindly provided by Martin)
+- White LED for illumination while focusing and taking "Day" images
 - Flask-based local web application
 
 ---
 
-## ✨ Features
+## Features
 
 - Live preview for camera focusing
 - Acquisition of:
@@ -24,16 +25,16 @@ The system is built around:
 
 ---
 
-## 🫖 Running the GUI as a Background Service
+<H2>🫖 Running the GUI as a Background Service</H2>
+<details>
+<summary> To have continous access to the GUI, it has to automatically start and run continuously on the Raspberry Pi:</summary>
 
-To allow the GUI to start automatically and run continuously on the Raspberry Pi:
-
-### 1. Copy the `.service` file to the Raspberry Pi
+### 1. Copy the `biolum_controller.service` file to the Raspberry Pi
 
 Example using `scp`:
 
 ```bash
-scp controller.service pi@<RPI_IP>:~
+scp biolum_controller.service pi@<RPI_IP>:~
 ```
 
 ---
@@ -52,12 +53,12 @@ sudo systemctl enable controller
 sudo systemctl start controller
 ```
 
----
+</details>
 
-## 🌐 Accessing the Web GUI
+<details> <summary> <H2>🫖 Accessing the GUI </H2> </summary>
 
 1. Connect a laptop to the Raspberry Pi hotspot/network.
-2. Determine the Raspberry Pi IP address:
+2. Determine the Raspberry Pi IP address (RPI_IP):
 
 ```bash
 hostname -I
@@ -76,8 +77,9 @@ http://10.42.0.1:5000/
 ```
 
 ---
+</details>
 
-## 🦾 Restarting the Controller During Development
+<details> <summary> <H2>⚙ Restarting the Controller During Development </H2> </summary>
 
 After updating the GUI/controller code, restart the service:
 
@@ -94,3 +96,4 @@ sleep 1
 
 sudo systemctl start controller
 ```
+</details>

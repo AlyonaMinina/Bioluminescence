@@ -45,7 +45,7 @@ cd "C:\Users\Your_User_Name\Downloads\Bioluminescence-main"
 8. Still in the same Command Prompt window, start the application:
 
 ```bash
-python biolum_analysis.py
+python biolum_analyzer.py
 ```
 
 9. The GUI will open in your web browser at:

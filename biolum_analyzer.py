@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-biolum_analysis.py — Bioluminescence Image Analysis Tool
+Bioluminescence Image Analysis Tool
 Run on your laptop to analyze images from experiment folders.
 
 Usage:
-    python biolum_analysis.py
+    python biolum_analyzer.py
 
 Then open: http://localhost:5001
 """
@@ -16,21 +16,52 @@ import numpy as np
 import json
 import io
 import os
+import re
 import webbrowser
 import threading
 import sys
+import uuid
+import time
+
+APP_DIR = Path(__file__).resolve().parent
+APP_ICON = Path(os.environ.get("BIOLUM_ICON", APP_DIR / "biolum_icon.ico")).expanduser()
 
 app = Flask(__name__)
+MEASURE_JOBS = {}
+MEASURE_JOBS_LOCK = threading.Lock()
 
 # ── helpers ───────────────────────────────────────────────────────────────────
 
 def detect_image_type(stem):
     s = stem.lower()
+    if re.search(r'(^|_)tl\d+(_|$)', s):
+        return 'biolum'
     if any(kw in s for kw in ('biolum', 'bio', 'dark', 'night', 'lum')):
         return 'biolum'
     if any(kw in s for kw in ('day', 'light', 'white', 'bright')):
         return 'day'
     return 'unknown'
+
+def parse_timelapse_stem(stem):
+    """Return stack metadata for names like sample_tl0001_1sec_193206."""
+    m = re.match(r'^(?P<sample>.+?)_tl(?P<frame>\d+)_(?P<exposure>[^_]+sec)(?:_|$)', stem, re.I)
+    if not m:
+        return None
+    return {
+        "sample": m.group("sample").strip(),
+        "frame": int(m.group("frame")),
+        "exposure": m.group("exposure"),
+    }
+
+def parse_frame_timestamp(stem):
+    """Return HHMMSS timestamp from the final filename token, if present."""
+    m = re.search(r'_(\d{6})$', stem)
+    if not m:
+        return None
+    try:
+        return datetime.strptime(m.group(1), "%H%M%S")
+    except ValueError:
+        return None
 
 def find_pairs(folder):
     """Find JPEG+NEF pairs in a folder, grouped by stem."""
@@ -48,7 +79,39 @@ def find_pairs(folder):
                 stems[stem]['jpg'] = str(f)
             else:
                 stems[stem]['nef'] = str(f)
-    return [v for v in stems.values() if v['jpg'] or v['nef']]
+
+    stacks = {}
+    singles = []
+    for item in stems.values():
+        if not (item['jpg'] or item['nef']):
+            continue
+        tl = parse_timelapse_stem(item['stem'])
+        if not tl:
+            singles.append(item)
+            continue
+
+        key = (tl["sample"].lower(), tl["exposure"].lower())
+        if key not in stacks:
+            stacks[key] = {
+                "stem": f"{tl['sample']}_{tl['exposure']}_timelapse",
+                "sample": tl["sample"],
+                "exposure": tl["exposure"],
+                "type": "biolum",
+                "is_stack": True,
+                "frames": [],
+                "jpg": None,
+                "nef": None,
+            }
+        frame = {**item, "frame": tl["frame"], "sample": tl["sample"], "exposure": tl["exposure"]}
+        stacks[key]["frames"].append(frame)
+
+    for stack in stacks.values():
+        stack["frames"].sort(key=lambda f: f["frame"])
+        first = stack["frames"][0]
+        stack["jpg"] = first.get("jpg")
+        stack["nef"] = first.get("nef")
+
+    return singles + list(stacks.values())
 
 def get_experiments(base_folder):
     """Return experiment subfolders."""
@@ -57,7 +120,7 @@ def get_experiments(base_folder):
         return []
     return [str(f) for f in sorted(base.iterdir(), reverse=True) if f.is_dir()]
 
-def measure_nef(nef_path, rois, jpeg_size):
+def measure_nef(nef_path, rois, jpeg_size, progress_callback=None):
     """
     Measure integrated density from NEF for each ROI.
     rois: list of {x, y, w, h} in JPEG pixel coordinates
@@ -71,7 +134,7 @@ def measure_nef(nef_path, rois, jpeg_size):
         rgb = raw.postprocess(
             output_bps=16,
             no_auto_bright=True,
-            use_camera_wb=True
+            use_camera_wb=False
         )
 
     nef_h, nef_w = rgb.shape[:2]
@@ -82,6 +145,9 @@ def measure_nef(nef_path, rois, jpeg_size):
 
     results = []
     for i, roi in enumerate(rois):
+        if progress_callback:
+            progress_callback(i, len(rois), roi, "measuring")
+
         # scale ROI coordinates to NEF resolution
         x1 = max(0, int(roi['x'] * scale_x))
         y1 = max(0, int(roi['y'] * scale_y))
@@ -124,13 +190,124 @@ def measure_nef(nef_path, rois, jpeg_size):
             'intden_G': float(np.sum(g_ch[mask])),
             'intden_B': float(np.sum(b_ch[mask])),
         })
+        if progress_callback:
+            progress_callback(i + 1, len(rois), roi, "finished")
 
     return results
 
+def _job_update(job_id, **updates):
+    with MEASURE_JOBS_LOCK:
+        job = MEASURE_JOBS.setdefault(job_id, {})
+        job.update(updates)
+
+def _job_status(job_id, status):
+    with MEASURE_JOBS_LOCK:
+        job = MEASURE_JOBS.get(job_id, {})
+        return job.get("status") == status
+
+def _job_snapshot(job_id):
+    with MEASURE_JOBS_LOCK:
+        job = MEASURE_JOBS.get(job_id)
+        return dict(job) if job else None
+
+def _roi_display_name(roi, index):
+    roi_number = roi.get("roi_number") or index + 1
+    if roi.get("type") == "bckg":
+        return f"background ROI {roi_number}"
+    return f"ROI {roi_number}"
+
+def _measure_job_worker(job_id, data):
+    mode = data.get("mode", "single")
+    rois = data.get("rois", [])
+    jpeg_size = data.get("jpeg_size", [1, 1])
+    all_measurements = []
+
+    try:
+        if mode == "stack":
+            frames = data.get("frames", [])
+            valid_frames = [f for f in frames if f.get("nef") and Path(f.get("nef")).exists()]
+            if not valid_frames:
+                raise ValueError("No NEF files found in stack")
+            valid_frames = sorted(valid_frames, key=lambda f: int(f.get("frame", 0)))
+            total = len(valid_frames) * len(rois)
+            _job_update(job_id, status="running", done=0, total=total,
+                        message=f"Preparing {len(valid_frames)} frames and {len(rois)} ROIs...")
+
+            base_ts = parse_frame_timestamp(valid_frames[0].get("stem", ""))
+            prev_ts = base_ts
+            day_offset = 0
+
+            for frame_idx, frame in enumerate(valid_frames):
+                stem = frame.get("stem", "")
+                ts = parse_frame_timestamp(stem)
+                if frame_idx == 0 or not base_ts or not ts:
+                    elapsed_min = 0.0
+                else:
+                    if prev_ts and ts < prev_ts:
+                        day_offset += 1
+                    elapsed_sec = (ts - base_ts).total_seconds() + day_offset * 24 * 3600
+                    elapsed_min = elapsed_sec / 60.0
+                if ts:
+                    prev_ts = ts
+
+                frame_label = f"frame {frame_idx + 1} of {len(valid_frames)}"
+                frame_base = frame_idx * len(rois)
+
+                def progress(done_in_frame, total_in_frame, roi, phase):
+                    roi_pos = done_in_frame - 1 if phase == "finished" else done_in_frame
+                    roi_idx = min(max(roi_pos, 0), max(total_in_frame - 1, 0))
+                    roi_name = _roi_display_name(roi, roi_idx)
+                    done = frame_base + done_in_frame
+                    if phase == "finished":
+                        done = frame_base + done_in_frame
+                        message = f"Finished {roi_name} in {frame_label}"
+                    else:
+                        message = f"Measuring {roi_name} in {frame_label}"
+                    _job_update(job_id, done=done, total=total, message=message)
+
+                frame_results = measure_nef(frame["nef"], rois, jpeg_size, progress_callback=progress)
+                for m in frame_results:
+                    m["frame_number"] = int(frame.get("frame", frame_idx + 1))
+                    m["frame_index"] = frame_idx
+                    m["elapsed_min"] = float(elapsed_min)
+                    m["frame_stem"] = stem
+                    m["nef_path"] = frame.get("nef", "")
+                all_measurements.extend(frame_results)
+                _job_update(job_id, done=frame_base + len(rois), total=total,
+                            message=f"Finished {frame_label}")
+        else:
+            nef_path = data.get("nef_path", "")
+            if not nef_path or not Path(nef_path).exists():
+                raise ValueError("NEF file not found")
+            total = len(rois)
+            _job_update(job_id, status="running", done=0, total=total,
+                        message=f"Preparing single image with {total} ROIs...")
+
+            def progress(done, total_rois, roi, phase):
+                roi_pos = done - 1 if phase == "finished" else done
+                roi_idx = min(max(roi_pos, 0), max(total_rois - 1, 0))
+                roi_name = _roi_display_name(roi, roi_idx)
+                message = f"Finished {roi_name}" if phase == "finished" else f"Measuring {roi_name} of {total_rois}"
+                _job_update(job_id, done=done, total=total_rois, message=message)
+                time.sleep(0.035)
+
+            all_measurements = measure_nef(nef_path, rois, jpeg_size, progress_callback=progress)
+
+        final_total = max(1, len(rois)) if mode != "stack" else max(1, len(valid_frames) * len(rois))
+        _job_update(job_id, status="finishing", done=final_total, total=final_total,
+                    message="Measurement complete")
+        time.sleep(0.35)
+        if _job_status(job_id, "finishing"):
+            _job_update(job_id, status="done", done=final_total, total=final_total,
+                        message="Measurement complete", measurements=all_measurements)
+    except Exception as e:
+        _job_update(job_id, status="error", error=str(e), message=f"Error: {e}")
+
 def save_results(folder, stem, rois, measurements, jpeg_size, snapshot_png="", save_dir=""):
     """Save ROIs as JSON, snapshot PNG, and measurements as Excel."""
-    if save_dir and Path(save_dir).exists():
+    if save_dir:
         analysis_dir = Path(save_dir)
+        analysis_dir.mkdir(parents=True, exist_ok=True)
     else:
         analysis_dir = Path(folder) / f"Analysis_{datetime.now().strftime('%Y%m%d_%H%M')}"
         analysis_dir.mkdir(parents=True, exist_ok=True)
@@ -151,29 +328,8 @@ def save_results(folder, stem, rois, measurements, jpeg_size, snapshot_png="", s
         return str(analysis_dir)
 
     # Excel
-    from openpyxl import Workbook
+    from openpyxl import Workbook, load_workbook
     from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
-    wb = Workbook()
-    ws = wb.active
-    ws.title = "Measurements"
-
-    header_fill = PatternFill(start_color="1F3864", end_color="1F3864", fill_type="solid")
-    header_font = Font(bold=True, color="FFFFFF", name="Calibri")
-    header_border = Border(bottom=Side(style='medium', color="2E74B5"))
-
-    # non-null nb value means background was measured for that ROI
-    has_nb = any(m.get('mean_B_nb') is not None for m in measurements)
-
-    headers = ['Sample', 'ROI', 'Area (px)', 'Mean B', 'Mean G', 'Mean R']
-    if has_nb:
-        headers += ['Mean B-Bckg', 'Mean G-Bckg', 'Mean R-Bckg']
-
-    ws.append(headers)
-    for cell in ws[1]:
-        cell.fill = header_fill
-        cell.font = header_font
-        cell.alignment = Alignment(horizontal='center')
-        cell.border = header_border
 
     fills = {
         'B':  PatternFill(start_color="E8EEFF", end_color="E8EEFF", fill_type="solid"),
@@ -190,14 +346,61 @@ def save_results(folder, stem, rois, measurements, jpeg_size, snapshot_png="", s
     def _r(v, d=1):
         return round(v, d) if isinstance(v, (int, float)) and v is not None else ''
 
+    xlsx_file = analysis_dir / "session_measurements.xlsx"
+
+    if xlsx_file.exists():
+        wb = load_workbook(xlsx_file)
+        ws = wb.active
+        existing_headers = [cell.value for cell in ws[1]]
+        has_frame = 'Frame' in existing_headers
+        has_elapsed = 'Elapsed (min)' in existing_headers
+        has_nb = 'Mean B-Bckg' in existing_headers
+    else:
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "Measurements"
+
+        header_fill = PatternFill(start_color="1F3864", end_color="1F3864", fill_type="solid")
+        header_font = Font(bold=True, color="FFFFFF", name="Calibri")
+        header_border = Border(bottom=Side(style='medium', color="2E74B5"))
+
+        has_nb = any(m.get('mean_B_nb') is not None for m in measurements)
+        has_frame = any(m.get('frame_number') is not None for m in measurements)
+        has_elapsed = any(m.get('elapsed_min') is not None for m in measurements)
+
+        headers = ['Sample', 'ROI']
+        if has_frame:
+            headers += ['Frame']
+        if has_elapsed:
+            headers += ['Elapsed (min)']
+        headers += ['Area (px)', 'Raw Mean B', 'Raw Mean G', 'Raw Mean R']
+        if has_nb:
+            headers += ['Mean B-Bckg', 'Mean G-Bckg', 'Mean R-Bckg']
+
+        ws.append(headers)
+        for cell in ws[1]:
+            cell.fill = header_fill
+            cell.font = header_font
+            cell.alignment = Alignment(horizontal='center')
+            cell.border = header_border
+
+        ws.freeze_panes = "A2"
+        for col in ws.columns:
+            letter = col[0].column_letter
+            ws.column_dimensions[letter].width = 28 if letter == 'A' else 12
+
     # col index (1-based) of first channel column
-    ch_base = 4  # D = Mean B
+    ch_base = 4 + int(has_frame) + int(has_elapsed)
 
     for m in measurements:
         is_bckg = m.get('roi_type') == 'bckg'
         sample = m.get('sample_name') or stem
-        row = [sample, m.get('roi_label', ''), m.get('area_px', 0),
-               _r(m.get('mean_B')), _r(m.get('mean_G')), _r(m.get('mean_R'))]
+        row = [sample, m.get('roi_label', '')]
+        if has_frame:
+            row.append(m.get('frame_number', ''))
+        if has_elapsed:
+            row.append(_r(m.get('elapsed_min'), 2))
+        row += [m.get('area_px', 0), _r(m.get('mean_B')), _r(m.get('mean_G')), _r(m.get('mean_R'))]
         if has_nb:
             row += [_r(m.get('mean_B_nb')), _r(m.get('mean_G_nb')), _r(m.get('mean_R_nb'))]
         ws.append(row)
@@ -211,16 +414,8 @@ def save_results(folder, stem, rois, measurements, jpeg_size, snapshot_png="", s
         for col, ch in col_map:
             ws.cell(rn, col).fill = fills[ch]
 
-    ws.freeze_panes = "A2"
     ws.auto_filter.ref = ws.dimensions
 
-    col_widths = [('A',28),('B',10),('C',10),('D',10),('E',10),('F',10)]
-    if has_nb:
-        col_widths += [('G',12),('H',12),('I',12)]
-    for col, w in col_widths:
-        ws.column_dimensions[col].width = w
-
-    xlsx_file = analysis_dir / "session_measurements.xlsx"
     wb.save(xlsx_file)
 
     return str(analysis_dir)
@@ -230,6 +425,13 @@ def save_results(folder, stem, rois, measurements, jpeg_size, snapshot_png="", s
 @app.route("/")
 def index():
     return HTML_PAGE
+
+@app.route("/app_icon.ico")
+@app.route("/favicon.ico")
+def app_icon():
+    if APP_ICON.exists():
+        return send_file(APP_ICON, mimetype="image/vnd.microsoft.icon")
+    return "", 404
 
 @app.route("/browse", methods=["POST"])
 def browse():
@@ -241,7 +443,6 @@ def browse():
         p = Path(folder)
         if p.exists():
             analysis_dir = str(p / f"Analysis_{datetime.now().strftime('%Y%m%d_%H%M')}")
-            Path(analysis_dir).mkdir(parents=True, exist_ok=True)
     except Exception:
         analysis_dir = ""
     return jsonify({"pairs": pairs, "folder": folder, "analysis_dir": analysis_dir})
@@ -337,6 +538,85 @@ def measure():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
+@app.route("/measure_stack", methods=["POST"])
+def measure_stack():
+    data = request.get_json()
+    frames = data.get("frames", [])
+    rois = data.get("rois", [])
+    jpeg_size = data.get("jpeg_size", [1, 1])
+
+    if not frames:
+        return jsonify({"error": "No stack frames provided"}), 400
+    if not rois:
+        return jsonify({"error": "No ROIs defined"}), 400
+
+    valid_frames = [f for f in frames if f.get("nef") and Path(f.get("nef")).exists()]
+    if not valid_frames:
+        return jsonify({"error": "No NEF files found in stack"}), 400
+
+    valid_frames = sorted(valid_frames, key=lambda f: int(f.get("frame", 0)))
+    base_ts = parse_frame_timestamp(valid_frames[0].get("stem", ""))
+    prev_ts = base_ts
+    day_offset = 0
+
+    all_measurements = []
+    try:
+        for idx, frame in enumerate(valid_frames):
+            stem = frame.get("stem", "")
+            ts = parse_frame_timestamp(stem)
+            if idx == 0 or not base_ts or not ts:
+                elapsed_min = 0.0
+            else:
+                if prev_ts and ts < prev_ts:
+                    day_offset += 1
+                elapsed_sec = (ts - base_ts).total_seconds() + day_offset * 24 * 3600
+                elapsed_min = elapsed_sec / 60.0
+            if ts:
+                prev_ts = ts
+
+            frame_results = measure_nef(frame["nef"], rois, jpeg_size)
+            for m in frame_results:
+                m["frame_number"] = int(frame.get("frame", idx + 1))
+                m["frame_index"] = idx
+                m["elapsed_min"] = float(elapsed_min)
+                m["frame_stem"] = stem
+                m["nef_path"] = frame.get("nef", "")
+            all_measurements.extend(frame_results)
+        return jsonify({"measurements": all_measurements})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route("/measure_job", methods=["POST"])
+def measure_job():
+    data = request.get_json()
+    mode = data.get("mode", "single")
+    rois = data.get("rois", [])
+
+    if not rois:
+        return jsonify({"error": "No ROIs defined"}), 400
+    if mode == "stack":
+        frames = data.get("frames", [])
+        if not frames:
+            return jsonify({"error": "No stack frames provided"}), 400
+    else:
+        nef_path = data.get("nef_path", "")
+        if not nef_path or not Path(nef_path).exists():
+            return jsonify({"error": "NEF file not found"}), 400
+
+    job_id = uuid.uuid4().hex
+    _job_update(job_id, status="queued", done=0, total=max(1, len(rois)),
+                message="Queued measurement...", measurements=[])
+    worker = threading.Thread(target=_measure_job_worker, args=(job_id, data), daemon=True)
+    worker.start()
+    return jsonify({"job_id": job_id})
+
+@app.route("/measure_job/<job_id>")
+def measure_job_status(job_id):
+    job = _job_snapshot(job_id)
+    if not job:
+        return jsonify({"error": "Measurement job not found"}), 404
+    return jsonify(job)
+
 @app.route("/save", methods=["POST"])
 def save():
     data = request.get_json()
@@ -388,14 +668,47 @@ def load_rois():
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)})
 
+@app.route("/autosave_rois", methods=["POST"])
+def autosave_rois():
+    data = request.get_json()
+    folder = data.get("folder", "")
+    save_dir = data.get("save_dir") or ""
+    stem = data.get("stem", "analysis")
+    rois = data.get("rois", [])
+    jpeg_size = data.get("jpeg_size", [1, 1])
+    try:
+        if save_dir:
+            out_dir = Path(save_dir)
+        else:
+            out_dir = Path(folder) / f"Analysis_{datetime.now().strftime('%Y%m%d_%H%M')}"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        out_path = out_dir / f"{stem}_rois.json"
+        with open(out_path, 'w') as f:
+            json.dump({
+                'stem': stem,
+                'jpeg_size': jpeg_size,
+                'rois': rois,
+                'autosaved': True,
+                'saved_at': datetime.now().isoformat(timespec='seconds'),
+            }, f, indent=2)
+        return jsonify({"ok": True, "path": str(out_path), "dir": str(out_dir)})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)})
+
 @app.route("/list_roi_files", methods=["POST"])
 def list_roi_files():
     data = request.get_json()
     folder = data.get("folder", "")
     files = []
-    for p in Path(folder).rglob("*_rois.json"):
-        files.append({"name": p.name, "path": str(p)})
-    return jsonify({"files": files})
+    try:
+        root = Path(folder)
+        if not root.exists():
+            return jsonify({"files": [], "folder": folder, "error": "Folder not found"})
+        for p in sorted(root.rglob("*_rois.json"), reverse=True):
+            files.append({"name": p.name, "path": str(p), "folder": str(p.parent)})
+        return jsonify({"files": files, "folder": str(root)})
+    except Exception as e:
+        return jsonify({"files": [], "folder": folder, "error": str(e)})
 
 @app.route("/download")
 def download():
@@ -410,6 +723,12 @@ def pick_folder():
     import tkinter as tk
     from tkinter import filedialog
     root = tk.Tk()
+    if APP_ICON.exists():
+        try:
+            root.iconbitmap(str(APP_ICON))
+        except tk.TclError:
+            pass
+    root.title("Biolum Analyzer")
     root.withdraw()
     root.wm_attributes('-topmost', True)
     folder = filedialog.askdirectory(title="Select Experiment Folder")
@@ -423,7 +742,9 @@ HTML_PAGE = """<!DOCTYPE html>
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Biolum Analysis</title>
+  <title>Biolum Analyzer</title>
+  <link rel="icon" href="/favicon.ico" type="image/x-icon">
+  <link rel="shortcut icon" href="/favicon.ico" type="image/x-icon">
   <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@300;400;500&family=IBM+Plex+Sans:wght@300;400;600&display=swap" rel="stylesheet">
   <style>
     *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
@@ -469,12 +790,26 @@ HTML_PAGE = """<!DOCTYPE html>
     }
 
     .brand {
+      display: flex;
+      align-items: center;
+      gap: 8px;
       font-family: var(--mono);
       font-size: 13px;
       letter-spacing: 0.15em;
       color: var(--accent);
       text-transform: uppercase;
       flex-shrink: 0;
+    }
+    .brand-icon {
+      width: 18px;
+      height: 18px;
+      object-fit: contain;
+      flex-shrink: 0;
+    }
+    .brand-fallback {
+      display: none;
+      font-size: 13px;
+      line-height: 1;
     }
 
     .header-path {
@@ -894,7 +1229,11 @@ HTML_PAGE = """<!DOCTYPE html>
 <div class="app">
 
   <header>
-    <div class="brand">◉ Biolum Analysis</div>
+    <div class="brand">
+      <img class="brand-icon" src="/app_icon.ico" alt="" onerror="this.style.display='none';this.nextElementSibling.style.display='inline';">
+      <span class="brand-fallback">◉</span>
+      <span>Biolum Analyzer</span>
+    </div>
     <button class="top-tab-btn active" id="top-tab-btn-measure" onclick="switchTopTab('measure')">Measurement</button>
     <button class="top-tab-btn" id="top-tab-btn-summary" onclick="switchTopTab('summary')">Analysis Summary</button>
     <div class="header-path" id="header-path">No folder loaded</div>
@@ -961,6 +1300,12 @@ HTML_PAGE = """<!DOCTYPE html>
           </div>
           <canvas id="biolum-canvas" style="display:none"></canvas>
           <button class="canvas-clear-btn" id="biolum-clear-btn" onclick="clearPanel('biolum')" style="display:none;" title="Clear biolum image">✕ Clear</button>
+          <div id="tl-frame-controls" style="display:none;position:absolute;left:10px;right:10px;bottom:34px;align-items:center;gap:8px;background:rgba(6,9,13,0.88);border:1px solid var(--border2);border-radius:3px;padding:5px 8px;font-family:var(--mono);font-size:10px;color:var(--text);">
+            <button class="btn btn-ghost btn-sm" style="width:auto;padding:2px 7px;" onclick="stepBiolumStackFrame(-1)">‹</button>
+            <input id="tl-frame-slider" type="range" min="0" max="0" value="0" step="1" style="flex:1;" oninput="loadBiolumStackFrame(parseInt(this.value))">
+            <button class="btn btn-ghost btn-sm" style="width:auto;padding:2px 7px;" onclick="stepBiolumStackFrame(1)">›</button>
+            <span id="tl-frame-label" style="min-width:76px;text-align:right;color:var(--accent);">Frame 1/1</span>
+          </div>
           <div class="canvas-sample" id="biolum-sample-label" style="display:none;"></div>
         </div>
       </div>
@@ -1016,17 +1361,50 @@ HTML_PAGE = """<!DOCTYPE html>
   <!-- Analysis Summary — full-size pane -->
   <div class="top-tab-pane" id="top-tab-summary">
     <div style="display:flex;justify-content:space-between;align-items:center;flex-shrink:0;">
-      <span style="font-family:var(--mono);font-size:11px;color:var(--muted);letter-spacing:0.15em;text-transform:uppercase;">Mean IntDen per sample — background subtracted</span>
-      <button class="btn btn-sm" onclick="exportSummaryPDF()" style="margin-right:6px;">Export PDF</button>
-      <button class="btn btn-red btn-sm" onclick="clearAnalysisData()">Clear data</button>
+      <span style="font-family:var(--mono);font-size:11px;color:var(--muted);letter-spacing:0.15em;text-transform:uppercase;">Mean IntDen per sample</span>
+      <div style="display:flex;align-items:center;gap:8px;">
+        <div id="ratio-controls" style="display:flex;align-items:center;gap:5px;font-family:var(--mono);font-size:10px;color:var(--muted);">
+          <label style="display:flex;align-items:center;gap:5px;color:var(--text);margin-right:8px;">
+            <input id="summary-use-bckg" type="checkbox" onchange="renderSummary()">
+            <span>Bckg-subtracted</span>
+          </label>
+          <label style="display:flex;align-items:center;gap:5px;color:var(--text);margin-right:8px;">
+            <input id="summary-show-ratio" type="checkbox" onchange="renderSummary()">
+            <span>Show ratio</span>
+          </label>
+          <span>Ratio</span>
+          <select id="ratio-num" onchange="renderSummary()" style="font-family:var(--mono);font-size:10px;background:var(--bg);color:var(--text);border:1px solid var(--border2);border-radius:3px;padding:3px 5px;">
+            <option value="G" selected>Green</option>
+            <option value="R">Red</option>
+            <option value="B">Blue</option>
+          </select>
+          <span>/</span>
+          <select id="ratio-den" onchange="renderSummary()" style="font-family:var(--mono);font-size:10px;background:var(--bg);color:var(--text);border:1px solid var(--border2);border-radius:3px;padding:3px 5px;">
+            <option value="R" selected>Red</option>
+            <option value="G">Green</option>
+            <option value="B">Blue</option>
+          </select>
+        </div>
+        <div id="summary-order-controls" style="display:none;align-items:center;gap:4px;font-family:var(--mono);font-size:10px;color:var(--muted);">
+          <span>Order</span>
+          <select id="summary-order-sample" style="font-family:var(--mono);font-size:10px;background:var(--bg);color:var(--text);border:1px solid var(--border2);border-radius:3px;padding:3px 5px;max-width:150px;"></select>
+          <button class="btn btn-ghost btn-sm" onclick="moveSummarySample(-1)" title="Move selected sample left">←</button>
+          <button class="btn btn-ghost btn-sm" onclick="moveSummarySample(1)" title="Move selected sample right">→</button>
+        </div>
+        <button class="btn btn-sm" onclick="exportSummaryPDF()" style="margin-right:6px;">Export PDF</button>
+        <button class="btn btn-red btn-sm" onclick="clearAnalysisData()">Clear data</button>
+      </div>
     </div>
     <div id="summary-empty" style="font-family:var(--mono);font-size:13px;color:var(--muted);text-align:center;padding:40px;">
       Measure samples in the Measurement tab to build the summary
     </div>
-    <div style="display:flex;gap:16px;flex:1;min-height:0;" id="summary-plots">
+    <div style="display:flex;gap:16px;flex:1;min-height:220px;" id="summary-plots">
       <canvas id="plot-b" style="flex:1;min-width:0;"></canvas>
       <canvas id="plot-g" style="flex:1;min-width:0;"></canvas>
       <canvas id="plot-r" style="flex:1;min-width:0;"></canvas>
+    </div>
+    <div style="display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:16px;flex:0.8;min-height:220px;" id="summary-ratio-plot">
+      <canvas id="plot-ratio" style="grid-column:2;min-width:0;"></canvas>
     </div>
   </div>
 
@@ -1037,6 +1415,12 @@ HTML_PAGE = """<!DOCTYPE html>
 <div id="roi-dialog" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,0.7);z-index:1000;align-items:center;justify-content:center;">
   <div style="background:var(--panel);border:1px solid var(--border2);border-radius:4px;padding:20px;width:500px;max-height:60vh;display:flex;flex-direction:column;gap:12px;">
     <div style="font-family:var(--mono);font-size:12px;letter-spacing:0.1em;color:var(--accent);text-transform:uppercase;">Load Saved ROIs</div>
+    <div style="display:flex;gap:6px;align-items:center;">
+      <input id="roi-search-folder" type="text" placeholder="ROI search folder"
+             style="flex:1;background:var(--bg);border:1px solid var(--border2);border-radius:3px;color:var(--text);font-family:var(--mono);font-size:11px;padding:6px 8px;">
+      <button class="btn btn-ghost btn-sm" style="width:auto;" onclick="pickRoiSearchFolder()">Browse</button>
+      <button class="btn btn-sm" style="width:auto;" onclick="refreshRoiFileList()">Search</button>
+    </div>
     <div id="roi-file-list" style="overflow-y:auto;flex:1;display:flex;flex-direction:column;gap:4px;"></div>
     <button class="btn btn-ghost" onclick="document.getElementById('roi-dialog').style.display='none'">Cancel</button>
   </div>
@@ -1046,6 +1430,11 @@ HTML_PAGE = """<!DOCTYPE html>
   // fix Windows backslashes for URL passing
   var _BS = String.fromCharCode(92);
   function fixPath(p) { return p ? p.split(_BS).join('/') : ''; }
+  function escHtml(v) {
+    return String(v ?? '').replace(/[&<>"']/g, ch => ({
+      '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;'
+    }[ch]));
+  }
 
   // ── state ──
   let dayPair = null;
@@ -1065,17 +1454,32 @@ HTML_PAGE = """<!DOCTYPE html>
   let measurements = [];
   let analysisData = [];
   let analysisDataUid = 0;
+  let summarySampleOrder = [];
   let renameMode = false;
   let lastSaveDir = null;
   let sessionMeasurements = [];
+  let roiAutosaveTimer = null;
+  let unsavedResults = false;
+  let savePromptShown = false;
   const SUMMARY_CHANNELS = [
-    {id:'plot-b', key:'mean_B_nb', color:'#88bbff', colorExport:'#1030c0', label:'Mean B-Bckg'},
-    {id:'plot-g', key:'mean_G_nb', color:'#55e888', colorExport:'#0e7a2e', label:'Mean G-Bckg'},
-    {id:'plot-r', key:'mean_R_nb', color:'#ff9999', colorExport:'#b01010', label:'Mean R-Bckg'},
+    {id:'plot-b', channel:'B', rawKey:'mean_B', nbKey:'mean_B_nb', color:'#88bbff', colorExport:'#1030c0', rawLabel:'Mean B', nbLabel:'Mean B-Bckg'},
+    {id:'plot-g', channel:'G', rawKey:'mean_G', nbKey:'mean_G_nb', color:'#55e888', colorExport:'#0e7a2e', rawLabel:'Mean G', nbLabel:'Mean G-Bckg'},
+    {id:'plot-r', channel:'R', rawKey:'mean_R', nbKey:'mean_R_nb', color:'#ff9999', colorExport:'#b01010', rawLabel:'Mean R', nbLabel:'Mean R-Bckg'},
   ];
+  const RATIO_CHANNELS = {
+    B: {rawKey:'mean_B', nbKey:'mean_B_nb', label:'Blue', short:'B'},
+    G: {rawKey:'mean_G', nbKey:'mean_G_nb', label:'Green', short:'G'},
+    R: {rawKey:'mean_R', nbKey:'mean_R_nb', label:'Red', short:'R'},
+  };
   let view = {scale: 1, dx: 0, dy: 0};
   let panStart = null;
   let dragRoiRef = null;
+
+  window.addEventListener('beforeunload', e => {
+    if (!unsavedResults) return;
+    e.preventDefault();
+    e.returnValue = '';
+  });
 
   // canvas refs
   const dayCanvas = document.getElementById('day-canvas');
@@ -1084,6 +1488,7 @@ HTML_PAGE = """<!DOCTYPE html>
   const biolumCtx = biolumCanvas.getContext('2d');
   let dayImg = null;
   let biolumImg = null;
+  let biolumFrameIndex = 0;
 
   // ROI colours
   const ROI_COLORS = ['#4af0c4','#f0c44a','#f04a6a','#a04af0','#4a80f0','#f0804a'];
@@ -1127,15 +1532,17 @@ HTML_PAGE = """<!DOCTYPE html>
       sessionMeasurements = [];
       analysisData = [];
       analysisDataUid = 0;
+      summarySampleOrder = [];
       document.getElementById('header-path').textContent = folder;
       const name = fixPath(folder).split('/').filter(Boolean).pop() || folder;
       document.getElementById('experiment-label').textContent = name;
       document.getElementById('folder-input').value = folder;
       dayPair = null; biolumPair = null; dayImg = null; biolumImg = null;
+      document.getElementById('tl-frame-controls').style.display = 'none';
       setSampleLabel('day', null); setSampleLabel('biolum', null);
       renderPairList(data.pairs);
       const dirMsg = lastSaveDir ? (' → ' + fixPath(lastSaveDir).split('/').filter(Boolean).pop()) : '';
-      setStatus('Loaded ' + data.pairs.length + ' images' + dirMsg, 'ok');
+      setStatus('Loaded ' + data.pairs.length + ' image items' + dirMsg, 'ok');
     } catch(e) {
       setStatus('Load error: ' + e.message, 'err');
     }
@@ -1143,17 +1550,18 @@ HTML_PAGE = """<!DOCTYPE html>
 
   function renderPairList(pairs) {
     const list = document.getElementById('pair-list');
-    document.getElementById('pair-count').textContent = pairs.length + ' pairs';
+    document.getElementById('pair-count').textContent = pairs.length + ' items';
     if (!pairs.length) {
       list.innerHTML = '<div style="padding:20px;text-align:center;font-family:var(--mono);font-size:11px;color:var(--muted);">No image pairs found</div>';
       return;
     }
     list.innerHTML = pairs.map((p, i) => `
-      <div class="pair-item" onclick="loadPair(${i})" id="pair-${i}" data-pair='${JSON.stringify(p)}'>
+      <div class="pair-item" onclick="loadPair(${i})" id="pair-${i}" data-pair="${encodeURIComponent(JSON.stringify(p))}">
         <div style="display:flex;align-items:center;justify-content:space-between;gap:4px;">
-          <span style="overflow:hidden;text-overflow:ellipsis;">${p.stem}</span>
-          <span class="badge badge-${p.type}" style="flex-shrink:0;">${p.type.toUpperCase()}</span>
+          <span style="overflow:hidden;text-overflow:ellipsis;">${escHtml(p.stem)}</span>
+          <span class="badge badge-${p.type}" style="flex-shrink:0;">${p.is_stack ? 'TL' : p.type.toUpperCase()}</span>
         </div>
+        ${p.is_stack ? `<div style="font-size:10px;color:var(--muted);margin-top:4px;">${p.frames.length} frames · ${p.exposure}</div>` : ''}
       </div>
     `).join('');
   }
@@ -1169,21 +1577,31 @@ HTML_PAGE = """<!DOCTYPE html>
     }
   }
 
+  function clearCurrentMeasurementView() {
+    measurements = [];
+    selectedRoi = -1;
+    document.getElementById('results-table-wrap').innerHTML =
+      '<div style="font-family:var(--mono);font-size:11px;color:var(--muted);">Draw ROIs then click â–¶ Measure ROIs</div>';
+    document.getElementById('download-links').innerHTML = '';
+    unsavedResults = false;
+    savePromptShown = false;
+  }
+
   async function loadPair(idx) {
     const el = document.getElementById('pair-' + idx);
-    const pair = JSON.parse(el.dataset.pair);
+    const pair = JSON.parse(decodeURIComponent(el.dataset.pair));
     const isDay = pair.type !== 'biolum';
-    const newSample = sampleName(pair.stem);
+    const newSample = pair.sample || sampleName(pair.stem);
 
     // Enforce same-sample pairing
     if (isDay && biolumPair) {
-      const existing = sampleName(biolumPair.stem);
+      const existing = biolumPair.sample || sampleName(biolumPair.stem);
       if (newSample.toLowerCase() !== existing.toLowerCase()) {
         setStatus('Sample mismatch: "' + newSample + '" vs loaded biolum "' + existing + '". Clear the biolum image first.', 'err');
         return;
       }
     } else if (!isDay && dayPair) {
-      const existing = sampleName(dayPair.stem);
+      const existing = dayPair.sample || sampleName(dayPair.stem);
       if (newSample.toLowerCase() !== existing.toLowerCase()) {
         setStatus('Sample mismatch: "' + newSample + '" vs loaded day "' + existing + '". Clear the day image first.', 'err');
         return;
@@ -1204,6 +1622,7 @@ HTML_PAGE = """<!DOCTYPE html>
       document.getElementById('download-links').innerHTML = '';
     } else {
       biolumPair = pair;
+      clearCurrentMeasurementView();
     }
 
     if (pair.jpg) {
@@ -1216,14 +1635,24 @@ HTML_PAGE = """<!DOCTYPE html>
         dayImg.src = '/image?path=' + encodeURIComponent(pair.jpg);
         await new Promise(r => { dayImg.onload = r; });
       } else {
-        await loadImageToCanvas(pair.jpg, biolumCanvas, biolumCtx, 'biolum-placeholder');
-        biolumImg = new Image();
-        biolumImg.src = '/image?path=' + encodeURIComponent(pair.jpg);
-        await new Promise(r => { biolumImg.onload = r; });
+        if (pair.is_stack) {
+          await loadBiolumStackFrame(0, pair);
+        } else {
+          document.getElementById('tl-frame-controls').style.display = 'none';
+          await loadImageToCanvas(pair.jpg, biolumCanvas, biolumCtx, 'biolum-placeholder');
+          if (!dayPair) {
+            const sr = await fetch('/image_size?path=' + encodeURIComponent(pair.jpg));
+            const sd = await sr.json();
+            jpegSize = {w: sd.width, h: sd.height};
+          }
+          biolumImg = new Image();
+          biolumImg.src = '/image?path=' + encodeURIComponent(pair.jpg);
+          await new Promise(r => { biolumImg.onload = r; });
+        }
       }
     }
 
-    setSampleLabel(isDay ? 'day' : 'biolum', pair.stem);
+    setSampleLabel(isDay ? 'day' : 'biolum', pair.sample || pair.stem);
     document.getElementById((isDay ? 'day' : 'biolum') + '-clear-btn').style.display = '';
     drawAll();
 
@@ -1231,9 +1660,50 @@ HTML_PAGE = """<!DOCTYPE html>
       setStatus('"' + newSample + '" day loaded — select the matching biolum image.', 'wrn');
     } else if (!isDay && !dayPair) {
       setStatus('"' + newSample + '" biolum loaded — select the matching day image.', 'wrn');
+    } else if (!isDay && pair.is_stack) {
+      setStatus('Time-lapse stack loaded: ' + newSample + ' (' + pair.frames.length + ' frames)', 'ok');
     } else {
       setStatus('Set complete: ' + newSample, 'ok');
     }
+  }
+
+  async function loadBiolumStackFrame(idx, stack=null) {
+    const activeStack = stack || biolumPair;
+    if (!activeStack || !activeStack.is_stack || !activeStack.frames || !activeStack.frames.length) return;
+    idx = Math.max(0, Math.min(activeStack.frames.length - 1, idx || 0));
+    biolumFrameIndex = idx;
+    const frame = activeStack.frames[idx];
+    activeStack.jpg = frame.jpg;
+    activeStack.nef = frame.nef;
+
+    const controls = document.getElementById('tl-frame-controls');
+    const slider = document.getElementById('tl-frame-slider');
+    const label = document.getElementById('tl-frame-label');
+    controls.style.display = 'flex';
+    slider.max = String(activeStack.frames.length - 1);
+    slider.value = String(idx);
+    label.textContent = `Frame ${idx + 1}/${activeStack.frames.length}`;
+
+    if (!frame.jpg) {
+      setStatus('Selected stack frame has no JPEG preview: ' + frame.stem, 'err');
+      return;
+    }
+
+    await loadImageToCanvas(frame.jpg, biolumCanvas, biolumCtx, 'biolum-placeholder');
+    if (!dayPair) {
+      const sr = await fetch('/image_size?path=' + encodeURIComponent(frame.jpg));
+      const sd = await sr.json();
+      jpegSize = {w: sd.width, h: sd.height};
+    }
+    biolumImg = new Image();
+    biolumImg.src = '/image?path=' + encodeURIComponent(frame.jpg);
+    await new Promise(r => { biolumImg.onload = r; });
+    drawAll();
+  }
+
+  function stepBiolumStackFrame(delta) {
+    if (!biolumPair || !biolumPair.is_stack) return;
+    loadBiolumStackFrame(biolumFrameIndex + delta);
   }
 
   async function loadImageToCanvas(path, canvas, ctx, placeholderId) {
@@ -1317,6 +1787,27 @@ HTML_PAGE = """<!DOCTYPE html>
     return {x: start.x + Math.sign(dx) * size, y: start.y + Math.sign(dy) * size};
   }
 
+  function ensureRoiNumbers() {
+    let roiMax = 0, bckgMax = 0;
+    rois.forEach(r => {
+      const n = Number(r.roi_number);
+      if (!n || n < 1) return;
+      if (r.type === 'bckg') bckgMax = Math.max(bckgMax, n);
+      else roiMax = Math.max(roiMax, n);
+    });
+    rois.forEach(r => {
+      if (Number(r.roi_number) > 0) return;
+      if (r.type === 'bckg') r.roi_number = ++bckgMax;
+      else r.roi_number = ++roiMax;
+    });
+  }
+
+  function nextRoiNumber(type) {
+    ensureRoiNumbers();
+    const sameType = rois.filter(r => (type === 'bckg') ? r.type === 'bckg' : r.type !== 'bckg');
+    return sameType.reduce((max, r) => Math.max(max, Number(r.roi_number) || 0), 0) + 1;
+  }
+
   function commitRoi(endPosDay) {
     let x = Math.min(drawStart.x, endPosDay.x);
     let y = Math.min(drawStart.y, endPosDay.y);
@@ -1324,16 +1815,20 @@ HTML_PAGE = """<!DOCTYPE html>
     let h = Math.abs(endPosDay.y - drawStart.y);
     if (fixedSize) { w = fixedSize.w; h = fixedSize.h; }
     if (w > 5 && h > 5) {
-      rois.push({x, y, w, h, shape: roiShape, type: roiType});
-      sortRois();
-      selectedRoi = rois.length - 1;
+      const roi = {x, y, w, h, shape: roiShape, type: roiType, roi_number: nextRoiNumber(roiType)};
+      rois.push(roi);
+      selectedRoi = rois.indexOf(roi);
+      renderRoiSetupTable();
+      scheduleRoiAutosave();
     }
     isDrawing = false;
     drawAll();
   }
 
   function sampleName(stem) {
-    let m = stem.match(/^(.+?)_biolum/i);
+    let m = stem.match(/^(.+?)_tl\\d+(?:_|$)/i);
+    if (m) return m[1].trim();
+    m = stem.match(/^(.+?)_biolum/i);
     if (m) return m[1].trim();
     m = stem.match(/^(.+?)_day/i);
     if (m) return m[1].trim();
@@ -1456,9 +1951,10 @@ HTML_PAGE = """<!DOCTYPE html>
     if (isDrawing && mode === 'draw') {
       commitRoi(shiftKey ? constrainSquare(drawStart, pos) : pos);
     } else if ((mode === 'move' || mode === 'resize') && dragRoiRef) {
-      sortRois();
       selectedRoi = rois.indexOf(dragRoiRef);
       dragRoiRef = null;
+      renderRoiSetupTable();
+      scheduleRoiAutosave();
       drawAll();
     }
   }
@@ -1499,12 +1995,7 @@ HTML_PAGE = """<!DOCTYPE html>
   });
 
   function sortRois() {
-    // sort left to right, top to bottom (by row then column)
-    const rowThreshold = 20;
-    rois.sort((a, b) => {
-      if (Math.abs(a.y - b.y) > rowThreshold) return a.y - b.y;
-      return a.x - b.x;
-    });
+    // Keep ROI order stable. Numbering follows creation/load order so names do not drift.
   }
 
   function drawOneCanvas(ctx, canvas, img, isBiolum) {
@@ -1528,18 +2019,56 @@ HTML_PAGE = """<!DOCTYPE html>
   }
 
   function getRoiLabel(roi, idx) {
+    ensureRoiNumbers();
     if (roi.type === 'bckg') {
-      const n = rois.slice(0, idx+1).filter(r => r.type === 'bckg').length;
-      return 'B' + n;
+      return 'B' + roi.roi_number;
     }
-    const n = rois.slice(0, idx+1).filter(r => r.type !== 'bckg').length;
-    return String(n);
+    return String(roi.roi_number);
+  }
+
+  function getRoiTableLabel(roi, idx) {
+    ensureRoiNumbers();
+    if (roi.label) return roi.label;
+    if (roi.type === 'bckg') {
+      return 'Bckg ' + roi.roi_number;
+    }
+    return String(roi.roi_number);
+  }
+
+  function roiAreaPx(roi) {
+    if (!roi) return 0;
+    if ((roi.shape || 'rect') === 'circle') return Math.round(Math.PI * (roi.w / 2) * (roi.h / 2));
+    return Math.round(roi.w * roi.h);
+  }
+
+  function roiReferenceCanvas() {
+    if (dayPair && dayCanvas.width > 0 && dayCanvas.height > 0) return dayCanvas;
+    if (biolumPair && biolumCanvas.width > 0 && biolumCanvas.height > 0) return biolumCanvas;
+    return dayCanvas.width > 0 ? dayCanvas : biolumCanvas;
+  }
+
+  function scaledRoisToJpeg() {
+    const refCanvas = roiReferenceCanvas();
+    if (!refCanvas || refCanvas.width < 1 || refCanvas.height < 1) return [];
+    const scaleX = jpegSize.w / refCanvas.width;
+    const scaleY = jpegSize.h / refCanvas.height;
+    return rois.map(r => ({
+      ...r,
+      x: Math.round(r.x * scaleX),
+      y: Math.round(r.y * scaleY),
+      w: Math.round(r.w * scaleX),
+      h: Math.round(r.h * scaleY),
+      shape: r.shape || 'rect',
+      type: r.type || 'roi',
+      label: r.label || '',
+      roi_number: r.roi_number,
+    }));
   }
 
   function drawSingleRoi(ctx, x, y, w, h, shape, color, isSelected, label) {
     ctx.strokeStyle = color;
-    ctx.lineWidth = isSelected ? 2.5 : 1.5;
-    ctx.fillStyle = color + '22';
+    ctx.lineWidth = isSelected ? 1.8 : 1.1;
+    ctx.fillStyle = color + '0a';
     if (shape === 'circle') {
       ctx.beginPath();
       ctx.ellipse(x+w/2, y+h/2, w/2, h/2, 0, 0, Math.PI*2);
@@ -1547,12 +2076,18 @@ HTML_PAGE = """<!DOCTYPE html>
     } else {
       ctx.strokeRect(x, y, w, h);
       ctx.fillRect(x, y, w, h);
-      ctx.fillStyle = color;
-      ctx.fillRect(x+w-6, y+h-6, 6, 6);
     }
     ctx.fillStyle = color;
-    ctx.font = 'bold 12px IBM Plex Mono';
-    ctx.fillText(label, x+4, y+14);
+    ctx.font = '500 11px IBM Plex Mono';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.lineWidth = 1.4;
+    ctx.strokeStyle = 'rgba(0,0,0,0.65)';
+    ctx.strokeText(label, x + w / 2, y + h / 2);
+    ctx.fillStyle = color + 'dd';
+    ctx.fillText(label, x + w / 2, y + h / 2);
+    ctx.textAlign = 'start';
+    ctx.textBaseline = 'alphabetic';
   }
 
   function drawRois(ctx, canvas) {
@@ -1574,6 +2109,9 @@ HTML_PAGE = """<!DOCTYPE html>
       rois.splice(selectedRoi, 1);
       selectedRoi = -1;
       dragRoiRef = null;
+      measurements = [];
+      renderRoiSetupTable();
+      scheduleRoiAutosave();
       drawAll();
     }
   }
@@ -1582,6 +2120,18 @@ HTML_PAGE = """<!DOCTYPE html>
     rois = [];
     selectedRoi = -1;
     measurements = [];
+    sessionMeasurements = [];
+    analysisData = [];
+    analysisDataUid = 0;
+    summarySampleOrder = [];
+    unsavedResults = false;
+    savePromptShown = false;
+    document.getElementById('results-table-wrap').innerHTML =
+      '<div style="font-family:var(--mono);font-size:11px;color:var(--muted);">Draw ROIs then click ▶ Measure ROIs</div>';
+    document.getElementById('download-links').innerHTML = '';
+    renderSummary();
+    scheduleRoiAutosave(true);
+    setStatus('ROIs and measurements cleared', '');
     drawAll();
   }
 
@@ -1591,64 +2141,36 @@ HTML_PAGE = """<!DOCTYPE html>
     if (!rois.length) { setStatus('Draw at least one ROI first', 'wrn'); return; }
     if (!biolumPair || !biolumPair.nef) { setStatus('No biolum NEF loaded — select a biolum image with a NEF file', 'err'); return; }
 
-    sortRois();
-    setStatus('Reading NEF and measuring... (this may take a few seconds)', '');
+    syncRoiLabelsFromInputs();
+    ensureRoiNumbers();
+    const isStackMeasure = biolumPair && biolumPair.is_stack;
+    setStatus(isStackMeasure ? 'Reading all stack NEFs and measuring...' : 'Reading NEF and measuring... (this may take a few seconds)', '');
     document.getElementById('btn-measure').disabled = true;
 
-    // convert canvas ROIs to JPEG pixel coords
-    const scaleX = jpegSize.w / dayCanvas.width;
-    const scaleY = jpegSize.h / dayCanvas.height;
-    const scaledRois = rois.map(r => ({
-      x: Math.round(r.x * scaleX),
-      y: Math.round(r.y * scaleY),
-      w: Math.round(r.w * scaleX),
-      h: Math.round(r.h * scaleY),
-      shape: r.shape || 'rect',
-      type: r.type || 'roi',
-    }));
+    // convert canvas ROIs to JPEG pixel coords using day image when present,
+    // otherwise the biolum preview itself for biolum-only workflows.
+    const scaledRois = scaledRoisToJpeg();
+    if (!scaledRois.length) { setStatus('Could not scale ROIs - reload the image and try again', 'err'); return; }
 
-    const r = await fetch('/measure', {
-      method: 'POST',
-      headers: {'Content-Type':'application/json'},
-      body: JSON.stringify({
-        nef_path: biolumPair.nef,
-        rois: scaledRois,
-        jpeg_size: [jpegSize.w, jpegSize.h]
-      })
-    });
-    const data = await r.json();
-    document.getElementById('btn-measure').disabled = false;
+    const sample = biolumPair
+      ? (biolumPair.sample || sampleName(biolumPair.stem))
+      : (dayPair ? (dayPair.sample || sampleName(dayPair.stem)) : '');
 
-    if (data.error) { setStatus('Error: ' + data.error, 'err'); return; }
-    const sample = biolumPair ? sampleName(biolumPair.stem) : (dayPair ? sampleName(dayPair.stem) : '');
-
-    // compute background mean if any background ROIs exist
-    const bckgMeas = data.measurements.filter((m, i) => scaledRois[i] && scaledRois[i].type === 'bckg');
-    let bckgMean = null;
-    if (bckgMeas.length > 0) {
-      const avg = key => bckgMeas.reduce((s, m) => s + m[key], 0) / bckgMeas.length;
-      bckgMean = {
-        mean_R: avg('mean_R'), mean_G: avg('mean_G'), mean_B: avg('mean_B'),
-        intden_R: avg('intden_R'), intden_G: avg('intden_G'), intden_B: avg('intden_B'),
-      };
+    let rawMeasurements = [];
+    try {
+      if (isStackMeasure) {
+        rawMeasurements = await measureStackFramesWithProgress(scaledRois);
+      } else {
+        rawMeasurements = await measureSingleImageRoisWithProgress(scaledRois);
+      }
+    } catch (err) {
+      setStatus('Error: ' + err.message, 'err');
+      return;
+    } finally {
+      document.getElementById('btn-measure').disabled = false;
     }
 
-    let roiCount = 0, bckgCount = 0;
-    measurements = data.measurements.map((m, i) => {
-      const roiObj = scaledRois[i] || {};
-      const isB = roiObj.type === 'bckg';
-      if (isB) bckgCount++; else roiCount++;
-      const roi_label = isB ? ('Bckg ' + bckgCount) : String(roiCount);
-      const nb = bckgMean ? {
-        mean_R_nb:   isB ? null : m.mean_R   - bckgMean.mean_R,
-        mean_G_nb:   isB ? null : m.mean_G   - bckgMean.mean_G,
-        mean_B_nb:   isB ? null : m.mean_B   - bckgMean.mean_B,
-        intden_R_nb: isB ? null : m.intden_R - bckgMean.intden_R,
-        intden_G_nb: isB ? null : m.intden_G - bckgMean.intden_G,
-        intden_B_nb: isB ? null : m.intden_B - bckgMean.intden_B,
-      } : {};
-      return {...m, sample_name: sample, roi_type: roiObj.type||'roi', roi_label, ...nb};
-    });
+    measurements = buildMeasurements(rawMeasurements, scaledRois, sample);
 
     // accumulate session measurements (all ROIs including bckg)
     sessionMeasurements.push(...measurements);
@@ -1661,25 +2183,189 @@ HTML_PAGE = """<!DOCTYPE html>
         uid,
         sample: m.sample_name,
         roiLabel: m.roi_label,
-        mean_R_nb: m.mean_R_nb !== undefined && m.mean_R_nb !== null ? m.mean_R_nb : m.mean_R,
-        mean_G_nb: m.mean_G_nb !== undefined && m.mean_G_nb !== null ? m.mean_G_nb : m.mean_G,
-        mean_B_nb: m.mean_B_nb !== undefined && m.mean_B_nb !== null ? m.mean_B_nb : m.mean_B,
+        mean_R: m.mean_R,
+        mean_G: m.mean_G,
+        mean_B: m.mean_B,
+        mean_R_nb: m.mean_R_nb,
+        mean_G_nb: m.mean_G_nb,
+        mean_B_nb: m.mean_B_nb,
+        has_bckg: m.mean_R_nb !== undefined && m.mean_R_nb !== null,
+        frame_number: m.frame_number,
+        elapsed_min: m.elapsed_min,
       });
     });
 
     renderTable(measurements);
-    setStatus(`Measured ${measurements.length} ROIs from NEF (16-bit)`, 'ok');
+    unsavedResults = true;
+    savePromptShown = false;
+    setStatus(isStackMeasure
+      ? `Measured ${measurements.length} ROI rows across ${biolumPair.frames.length} stack frames`
+      : `Measured ${measurements.length} ROIs from NEF (16-bit)`, 'ok');
+    promptSaveResultsSoon();
+  }
+
+  function renderMeasureProgress(done, total, message, unit = 'ROIs') {
+    const wrap = document.getElementById('results-table-wrap');
+    const pct = total ? Math.round((done / total) * 100) : 0;
+    wrap.innerHTML = `
+      <div style="font-family:var(--mono);font-size:12px;color:var(--text);padding:14px 12px;">
+        <div style="display:flex;justify-content:space-between;gap:12px;margin-bottom:8px;">
+          <span>${message}</span>
+          <span style="color:var(--accent);">${done}/${total} ${unit}</span>
+        </div>
+        <div style="height:12px;background:#0b1018;border:1px solid var(--border2);border-radius:3px;overflow:hidden;">
+          <div style="width:${pct}%;height:100%;background:linear-gradient(90deg,var(--accent),var(--amber));transition:width 0.2s ease;"></div>
+        </div>
+      </div>`;
+  }
+
+  function frameTimestampSeconds(stem) {
+    const m = String(stem || '').match(/_(\\d{6})$/);
+    if (!m) return null;
+    const hh = parseInt(m[1].slice(0, 2), 10);
+    const mm = parseInt(m[1].slice(2, 4), 10);
+    const ss = parseInt(m[1].slice(4, 6), 10);
+    if (hh > 23 || mm > 59 || ss > 59) return null;
+    return hh * 3600 + mm * 60 + ss;
+  }
+
+  async function measureStackFramesWithProgress(scaledRois) {
+    const frames = (biolumPair.frames || [])
+      .filter(f => f.nef)
+      .slice()
+      .sort((a, b) => (a.frame || 0) - (b.frame || 0));
+    if (!frames.length) throw new Error('No NEF files found in stack');
+    return measureJobWithProgress({
+      mode: 'stack',
+      frames,
+      rois: scaledRois,
+      jpeg_size: [jpegSize.w, jpegSize.h]
+    }, 'Preparing stack measurement...');
+  }
+
+  async function measureSingleImageRoisWithProgress(scaledRois) {
+    return measureJobWithProgress({
+      mode: 'single',
+      nef_path: biolumPair.nef,
+      rois: scaledRois,
+      jpeg_size: [jpegSize.w, jpegSize.h]
+    }, 'Preparing single-image ROI measurement...');
+  }
+
+  async function measureJobWithProgress(payload, initialMessage) {
+    const totalHint = payload.mode === 'stack'
+      ? Math.max(1, (payload.frames || []).length * (payload.rois || []).length)
+      : Math.max(1, (payload.rois || []).length);
+    const progressUnit = payload.mode === 'stack' ? 'ROI steps' : 'ROIs';
+    renderMeasureProgress(0, totalHint, initialMessage, progressUnit);
+    await new Promise(requestAnimationFrame);
+
+    const start = await fetch('/measure_job', {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify(payload)
+    });
+    const started = await start.json();
+    if (started.error) throw new Error(started.error);
+    if (!started.job_id) throw new Error('Measurement job did not start');
+
+    while (true) {
+      await new Promise(resolve => setTimeout(resolve, 180));
+      const r = await fetch('/measure_job/' + encodeURIComponent(started.job_id));
+      const data = await r.json();
+      if (data.error) throw new Error(data.error);
+      renderMeasureProgress(data.done || 0, data.total || totalHint, data.message || 'Measuring...', progressUnit);
+      if (data.status === 'error') throw new Error(data.error || 'Measurement failed');
+      if (data.status === 'done') return data.measurements || [];
+    }
+  }
+
+  function buildMeasurements(rawMeasurements, scaledRois, sample) {
+    const groups = new Map();
+    rawMeasurements.forEach(m => {
+      const key = m.frame_index !== undefined ? m.frame_index : 0;
+      if (!groups.has(key)) groups.set(key, []);
+      groups.get(key).push(m);
+    });
+
+    const out = [];
+    [...groups.keys()].sort((a,b) => a-b).forEach(key => {
+      const rows = groups.get(key);
+      const bckgMeas = rows.filter((m, i) => scaledRois[i] && scaledRois[i].type === 'bckg');
+      let bckgMean = null;
+      if (bckgMeas.length > 0) {
+        const avg = k => bckgMeas.reduce((s, m) => s + m[k], 0) / bckgMeas.length;
+        bckgMean = {
+          mean_R: avg('mean_R'), mean_G: avg('mean_G'), mean_B: avg('mean_B'),
+          intden_R: avg('intden_R'), intden_G: avg('intden_G'), intden_B: avg('intden_B'),
+        };
+      }
+
+      let roiCount = 0, bckgCount = 0;
+      rows.forEach((m, i) => {
+        const roiObj = scaledRois[i] || {};
+        const isB = roiObj.type === 'bckg';
+        if (isB) bckgCount++; else roiCount++;
+        const stableNumber = roiObj.roi_number || (isB ? bckgCount : roiCount);
+        const defaultLabel = isB ? ('Bckg ' + stableNumber) : String(stableNumber);
+        const roi_label = (roiObj.label || '').trim() || defaultLabel;
+        const nb = bckgMean ? {
+          mean_R_nb:   isB ? null : m.mean_R   - bckgMean.mean_R,
+          mean_G_nb:   isB ? null : m.mean_G   - bckgMean.mean_G,
+          mean_B_nb:   isB ? null : m.mean_B   - bckgMean.mean_B,
+          intden_R_nb: isB ? null : m.intden_R - bckgMean.intden_R,
+          intden_G_nb: isB ? null : m.intden_G - bckgMean.intden_G,
+          intden_B_nb: isB ? null : m.intden_B - bckgMean.intden_B,
+        } : {};
+        out.push({...m, sample_name: sample, roi_type: roiObj.type||'roi', roi_label, roi_index: i, ...nb});
+      });
+    });
+    return out;
+  }
+
+  function currentSampleName() {
+    if (biolumPair) return biolumPair.sample || sampleName(biolumPair.stem);
+    if (dayPair) return dayPair.sample || sampleName(dayPair.stem);
+    return '';
+  }
+
+  function renderRoiSetupTable() {
+    if (!rois.length) {
+      measurements = [];
+      document.getElementById('results-table-wrap').innerHTML =
+        '<div style="font-family:var(--mono);font-size:11px;color:var(--muted);">Draw ROIs then click ▶ Measure ROIs</div>';
+      return;
+    }
+    ensureRoiNumbers();
+    measurements = rois.map((roi, i) => ({
+      sample_name: currentSampleName(),
+      roi_type: roi.type || 'roi',
+      roi_label: getRoiTableLabel(roi, i),
+      roi_index: i,
+      area_px: roiAreaPx(roi),
+      mean_B: null,
+      mean_G: null,
+      mean_R: null,
+    }));
+    renderTable(measurements);
   }
 
   function renderTable(data) {
     if (!data.length) return;
     const wrap = document.getElementById('results-table-wrap');
+    const esc = v => String(v ?? '').replace(/[&<>"']/g, ch => ({
+      '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;'
+    }[ch]));
     const hasBckg = data.some(m => m.mean_R_nb !== undefined && m.mean_R_nb !== null);
+    const hasFrame = data.some(m => m.frame_number !== undefined && m.frame_number !== null);
+    const hasElapsed = data.some(m => m.elapsed_min !== undefined && m.elapsed_min !== null);
     const valueCols = [
+      ...(hasFrame ? [{label:'Frame #', key:'frame_number'}] : []),
+      ...(hasElapsed ? [{label:'Elapsed (min)', key:'elapsed_min'}] : []),
       {label:'Area (px)', key:'area_px'},
-      {label:'Mean B', key:'mean_B', cls:'ch-b'},
-      {label:'Mean G', key:'mean_G', cls:'ch-g'},
-      {label:'Mean R', key:'mean_R', cls:'ch-r'},
+      {label:'Raw Mean B', key:'mean_B', cls:'ch-b'},
+      {label:'Raw Mean G', key:'mean_G', cls:'ch-g'},
+      {label:'Raw Mean R', key:'mean_R', cls:'ch-r'},
       ...(hasBckg ? [
         {label:'Mean B-Bckg', key:'mean_B_nb', cls:'ch-b-nb'},
         {label:'Mean G-Bckg', key:'mean_G_nb', cls:'ch-g-nb'},
@@ -1700,13 +2386,16 @@ HTML_PAGE = """<!DOCTYPE html>
           ${data.map((row, ri) => {
             const isB = row.roi_type === 'bckg';
             const rowCls = isB ? ' class="bckg-row"' : '';
-            const sampleCell = renameMode ? '' : `<td>${fmtVal(row.sample_name)}</td>`;
+            const sampleCell = renameMode ? '' : `<td>${esc(fmtVal(row.sample_name))}</td>`;
             const roiCell = (renameMode && !isB)
-              ? `<td><input type="text" value="${row.roi_label}" style="font-family:var(--mono);font-size:11px;background:transparent;border:1px solid var(--border2);color:var(--text);border-radius:2px;padding:1px 4px;width:80px;" onchange="renameMeasurement(${ri}, this.value)"></td>`
-              : `<td>${fmtVal(row.roi_label)}</td>`;
+              ? `<td><input type="text" value="${esc(row.roi_label)}" data-roi-index="${row.roi_index}" style="font-family:var(--mono);font-size:11px;background:transparent;border:1px solid var(--border2);color:var(--text);border-radius:2px;padding:1px 4px;width:80px;" oninput="renameMeasurement(${ri}, this.value)"></td>`
+              : `<td>${esc(fmtVal(row.roi_label))}</td>`;
             return `<tr${rowCls}>${sampleCell}${roiCell}${valueCols.map(c => {
               const cls = isB && (c.cls||'').includes('-nb') ? '' : (c.cls||'');
-              return `<td class="${cls}">${fmtVal(row[c.key])}</td>`;
+              const val = c.key === 'elapsed_min' && typeof row[c.key] === 'number'
+                ? row[c.key].toLocaleString(undefined, {maximumFractionDigits: 2})
+                : fmtVal(row[c.key]);
+              return `<td class="${cls}">${esc(val)}</td>`;
             }).join('')}</tr>`;
           }).join('')}
         </tbody>
@@ -1717,33 +2406,94 @@ HTML_PAGE = """<!DOCTYPE html>
   function toggleRenameMode() {
     renameMode = document.getElementById('rename-mode').checked;
     if (measurements.length) renderTable(measurements);
+    else renderRoiSetupTable();
     renderSummary();
+  }
+
+  function syncRoiLabelsFromInputs() {
+    document.querySelectorAll('#results-table-wrap input[data-roi-index]').forEach(inp => {
+      const idx = Number(inp.dataset.roiIndex);
+      if (Number.isInteger(idx) && rois[idx]) {
+        rois[idx].label = inp.value.trim();
+      }
+    });
   }
 
   function renameMeasurement(idx, newLabel) {
     const m = measurements[idx];
     if (!m || m.roi_type === 'bckg') return;
-    m.roi_label = newLabel;
-    if (m._uid !== undefined) {
-      const ad = analysisData.find(d => d.uid === m._uid);
-      if (ad) ad.roiLabel = newLabel;
+    const roiIndex = m.roi_index;
+    const cleanLabel = newLabel.trim();
+    if (roiIndex !== undefined && rois[roiIndex]) {
+      rois[roiIndex].label = cleanLabel;
     }
+    measurements.forEach(row => {
+      if (row.roi_index === roiIndex && row.roi_type !== 'bckg') {
+        row.roi_label = cleanLabel;
+        if (row._uid !== undefined) {
+          const ad = analysisData.find(d => d.uid === row._uid);
+          if (ad) ad.roiLabel = cleanLabel;
+        }
+      }
+    });
+    if (roiIndex === undefined) {
+      m.roi_label = cleanLabel;
+    }
+    drawAll();
     renderSummary();
+    scheduleRoiAutosave();
   }
 
   // ── save ──
+  function analysisStem() {
+    return biolumPair ? biolumPair.stem : (dayPair ? dayPair.stem : 'analysis');
+  }
+
+  function scaledRoisForSave() {
+    syncRoiLabelsFromInputs();
+    ensureRoiNumbers();
+    return scaledRoisToJpeg();
+  }
+
+  function scheduleRoiAutosave(force=false) {
+    if (roiAutosaveTimer) clearTimeout(roiAutosaveTimer);
+    roiAutosaveTimer = setTimeout(() => autosaveRoisNow(force), 700);
+  }
+
+  async function autosaveRoisNow(force=false) {
+    if ((!dayPair && !biolumPair) || (!force && !rois.length) || !currentFolder || dayCanvas.width < 1) return;
+    try {
+      const r = await fetch('/autosave_rois', {
+        method:'POST', headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({
+          folder: currentFolder,
+          save_dir: lastSaveDir,
+          stem: analysisStem(),
+          rois: scaledRoisForSave(),
+          jpeg_size: [jpegSize.w, jpegSize.h],
+        })
+      });
+      const data = await r.json();
+      if (data.ok && data.dir) lastSaveDir = data.dir;
+    } catch(e) {}
+  }
+
+  function promptSaveResultsSoon() {
+    if (savePromptShown) return;
+    savePromptShown = true;
+    setTimeout(() => {
+      if (unsavedResults && confirm('Measurements are complete. Save results now?')) {
+        saveResults();
+      }
+    }, 200);
+  }
+
   async function saveResults() {
     if ((!dayPair && !biolumPair) || !rois.length) { setStatus('Nothing to save', 'wrn'); return; }
 
-    const scaleX = jpegSize.w / dayCanvas.width;
-    const scaleY = jpegSize.h / dayCanvas.height;
-    const scaledRois = rois.map(r => ({
-      ...r,
-      x: Math.round(r.x * scaleX), y: Math.round(r.y * scaleY),
-      w: Math.round(r.w * scaleX), h: Math.round(r.h * scaleY),
-    }));
+    const scaledRois = scaledRoisForSave();
 
-    const saveStem = biolumPair ? biolumPair.stem : dayPair.stem;
+    const saveStem = analysisStem();
     const snapshot_png = captureSnapshotDataURL() || '';
     setStatus('Saving...', '');
     const r = await fetch('/save', {
@@ -1762,6 +2512,8 @@ HTML_PAGE = """<!DOCTYPE html>
     const data = await r.json();
     if (data.ok) {
       lastSaveDir = data.dir;
+      unsavedResults = false;
+      savePromptShown = false;
       setStatus('Saved to: ' + data.dir, 'ok');
       const links = document.getElementById('download-links');
       links.innerHTML = `
@@ -1776,22 +2528,41 @@ HTML_PAGE = """<!DOCTYPE html>
   // ── load ROIs ──
   async function showLoadRoiDialog() {
     if (!currentFolder) { setStatus('Load a folder first', 'wrn'); return; }
+    document.getElementById('roi-search-folder').value = currentFolder;
+    await refreshRoiFileList();
+    document.getElementById('roi-dialog').style.display = 'flex';
+  }
+
+  async function pickRoiSearchFolder() {
+    const r = await fetch('/pick_folder');
+    const data = await r.json();
+    if (!data.path) return;
+    document.getElementById('roi-search-folder').value = data.path;
+    await refreshRoiFileList();
+  }
+
+  async function refreshRoiFileList() {
+    const folder = document.getElementById('roi-search-folder').value || currentFolder;
     const r = await fetch('/list_roi_files', {
       method:'POST', headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({folder: currentFolder})
+      body: JSON.stringify({folder})
     });
     const data = await r.json();
     const list = document.getElementById('roi-file-list');
+    if (data.error) {
+      list.innerHTML = `<div style="font-family:var(--mono);font-size:11px;color:var(--warn);">${escHtml(data.error)}</div>`;
+      return;
+    }
     if (!data.files.length) {
       list.innerHTML = '<div style="font-family:var(--mono);font-size:11px;color:var(--muted);">No saved ROI files found in this folder.</div>';
     } else {
       list.innerHTML = data.files.map(f => `
-        <div data-path="${f.path}" onclick="loadRoiFile(this.dataset.path)"
+        <div data-path="${escHtml(f.path)}" onclick="loadRoiFile(this.dataset.path)"
              style="padding:8px 10px;border:1px solid var(--border2);border-radius:3px;cursor:pointer;font-family:var(--mono);font-size:11px;color:var(--text);">
-          ${f.name}
+          <div>${escHtml(f.name)}</div>
+          <div style="font-size:9px;color:var(--muted);margin-top:3px;">${escHtml(f.folder)}</div>
         </div>`).join('');
     }
-    document.getElementById('roi-dialog').style.display = 'flex';
   }
 
   function clearPanel(side) {
@@ -1811,8 +2582,10 @@ HTML_PAGE = """<!DOCTYPE html>
       biolumCanvas.style.display = 'none';
       document.getElementById('biolum-placeholder').style.display = '';
       document.getElementById('biolum-clear-btn').style.display = 'none';
+      document.getElementById('tl-frame-controls').style.display = 'none';
       setSampleLabel('biolum', null);
       document.querySelectorAll('.pair-item.active-biolum').forEach(e => e.classList.remove('active', 'active-biolum'));
+      clearCurrentMeasurementView();
     }
     drawAll();
     setStatus('Panel cleared. Select a new image.', '');
@@ -1836,6 +2609,7 @@ HTML_PAGE = """<!DOCTYPE html>
   // ── analysis summary / box plots ──
   function clearAnalysisData() {
     analysisData = [];
+    summarySampleOrder = [];
     renderSummary();
   }
 
@@ -1946,10 +2720,205 @@ HTML_PAGE = """<!DOCTYPE html>
   }
 
   function summaryGroupKey(d) { return renameMode ? (d.roiLabel || d.sample) : d.sample; }
+  function hasTimeSeriesData() {
+    return analysisData.some(d => d.elapsed_min !== undefined && d.elapsed_min !== null && isFinite(d.elapsed_min));
+  }
+  function timeSeriesKey(d) {
+    return summaryGroupKey(d) || 'sample';
+  }
+  function summaryGroups(useTimeSeries) {
+    const rawGroups = [...new Set(analysisData.map(useTimeSeries ? timeSeriesKey : summaryGroupKey))];
+    summarySampleOrder = summarySampleOrder.filter(name => rawGroups.includes(name));
+    rawGroups.forEach(name => {
+      if (!summarySampleOrder.includes(name)) summarySampleOrder.push(name);
+    });
+    return summarySampleOrder.length ? summarySampleOrder.filter(name => rawGroups.includes(name)) : rawGroups;
+  }
+  function updateSummaryOrderControls(groups, useTimeSeries) {
+    const wrap = document.getElementById('summary-order-controls');
+    const sel = document.getElementById('summary-order-sample');
+    if (!wrap || !sel) return;
+    if (useTimeSeries || groups.length < 2) {
+      wrap.style.display = 'none';
+      return;
+    }
+    const prev = sel.value;
+    wrap.style.display = 'flex';
+    sel.innerHTML = groups.map(name => `<option value="${escHtml(name)}">${escHtml(name)}</option>`).join('');
+    sel.value = groups.includes(prev) ? prev : groups[0];
+  }
+  function moveSummarySample(dir) {
+    const sel = document.getElementById('summary-order-sample');
+    if (!sel || !sel.value) return;
+    const idx = summarySampleOrder.indexOf(sel.value);
+    const nextIdx = idx + dir;
+    if (idx < 0 || nextIdx < 0 || nextIdx >= summarySampleOrder.length) return;
+    [summarySampleOrder[idx], summarySampleOrder[nextIdx]] = [summarySampleOrder[nextIdx], summarySampleOrder[idx]];
+    renderSummary();
+    const updated = document.getElementById('summary-order-sample');
+    if (updated) updated.value = summarySampleOrder[nextIdx];
+  }
+  function timeSeriesColor(i) {
+    const palette = ['#e7c84b', '#5bd6c6', '#ff8b72', '#8fb8ff', '#d59bff', '#74d36f', '#ffb45c', '#f27bb2'];
+    return palette[i % palette.length];
+  }
+
+  function useBackgroundSubtracted() {
+    return document.getElementById('summary-use-bckg')?.checked ?? true;
+  }
+
+  function valueKey(rawKey, nbKey, d = null) {
+    if (!useBackgroundSubtracted()) return rawKey;
+    return !d || d.has_bckg ? nbKey : rawKey;
+  }
+
+  function channelPlotValue(d, ch) {
+    return d[valueKey(ch.rawKey, ch.nbKey, d)];
+  }
+
+  function channelPlotLabel(ch) {
+    return useBackgroundSubtracted() ? ch.nbLabel : ch.rawLabel;
+  }
+
+  function ratioSpec() {
+    const num = document.getElementById('ratio-num')?.value || 'G';
+    const den = document.getElementById('ratio-den')?.value || 'R';
+    const numCh = RATIO_CHANNELS[num];
+    const denCh = RATIO_CHANNELS[den];
+    return {
+      num, den,
+      numKey: valueKey(numCh.rawKey, numCh.nbKey),
+      denKey: valueKey(denCh.rawKey, denCh.nbKey),
+      useBckg: useBackgroundSubtracted(),
+      label: `${numCh.label}/${denCh.label}`,
+      shortLabel: `${numCh.short}/${denCh.short}`,
+    };
+  }
+
+  function ratioValue(d) {
+    const spec = ratioSpec();
+    if (spec.useBckg && !d.has_bckg) return null;
+    const numCh = RATIO_CHANNELS[spec.num];
+    const denCh = RATIO_CHANNELS[spec.den];
+    const num = d[valueKey(numCh.rawKey, numCh.nbKey, d)];
+    const den = d[valueKey(denCh.rawKey, denCh.nbKey, d)];
+    if (!validRatioPair(num, den, spec, ratioDenominatorFloor(spec))) return null;
+    return num / den;
+  }
+
+  function validRatioPair(num, den, spec, denFloor) {
+    if (num === null || num === undefined || den === null || den === undefined) return false;
+    if (!isFinite(num) || !isFinite(den)) return false;
+    if (spec.useBckg) return num > 0 && den > denFloor;
+    return num >= 0 && den > 0;
+  }
+
+  function meanFinite(vals) {
+    const finite = vals.filter(v => v !== null && v !== undefined && isFinite(v));
+    return finite.length ? finite.reduce((sum, v) => sum + v, 0) / finite.length : null;
+  }
+
+  function medianValue(vals) {
+    if (!vals.length) return null;
+    const sorted = [...vals].sort((a, b) => a - b);
+    const mid = Math.floor(sorted.length / 2);
+    return sorted.length % 2 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2;
+  }
+
+  function ratioDenominatorFloor(spec = ratioSpec()) {
+    const positiveDens = analysisData
+      .map(d => spec.useBckg && !d.has_bckg ? null : d[valueKey(RATIO_CHANNELS[spec.den].rawKey, RATIO_CHANNELS[spec.den].nbKey, d)])
+      .filter(v => v !== null && v !== undefined && isFinite(v) && v > 0);
+    const med = medianValue(positiveDens);
+    return med !== null ? Math.max(med * 0.01, Number.EPSILON) : Number.EPSILON;
+  }
+
+  function ratioFromRows(rows, spec = ratioSpec(), denFloor = ratioDenominatorFloor(spec)) {
+    const numCh = RATIO_CHANNELS[spec.num];
+    const denCh = RATIO_CHANNELS[spec.den];
+    const paired = rows
+      .filter(d => !spec.useBckg || d.has_bckg)
+      .map(d => ({
+        num: d[valueKey(numCh.rawKey, numCh.nbKey, d)],
+        den: d[valueKey(denCh.rawKey, denCh.nbKey, d)],
+      }))
+      .filter(p => validRatioPair(p.num, p.den, spec, denFloor));
+    if (!paired.length) return null;
+    const numMean = meanFinite(paired.map(p => p.num));
+    const denMean = meanFinite(paired.map(p => p.den));
+    if (!validRatioPair(numMean, denMean, spec, denFloor)) return null;
+    return numMean / denMean;
+  }
+
+  function timeSeriesRatioPoints(seriesName, spec = ratioSpec()) {
+    const denFloor = ratioDenominatorFloor(spec);
+    const byTime = new Map();
+    analysisData
+      .filter(d =>
+        timeSeriesKey(d) === seriesName &&
+        d.elapsed_min !== undefined && d.elapsed_min !== null && isFinite(d.elapsed_min)
+      )
+      .forEach(d => {
+        const t = d.elapsed_min;
+        if (!byTime.has(t)) byTime.set(t, []);
+        byTime.get(t).push(d);
+      });
+    return [...byTime.entries()]
+      .map(([elapsed_min, rows]) => ({
+        elapsed_min: Number(elapsed_min),
+        value: ratioFromRows(rows, spec, denFloor),
+      }))
+      .filter(p => p.value !== null && p.value !== undefined && isFinite(p.value))
+      .sort((a, b) => a.elapsed_min - b.elapsed_min);
+  }
+
+  function timeSeriesDenominatorPoints(seriesName, spec = ratioSpec()) {
+    const denCh = RATIO_CHANNELS[spec.den];
+    const byTime = new Map();
+    analysisData
+      .filter(d =>
+        timeSeriesKey(d) === seriesName &&
+        (!spec.useBckg || d.has_bckg) &&
+        d.elapsed_min !== undefined && d.elapsed_min !== null && isFinite(d.elapsed_min)
+      )
+      .forEach(d => {
+        const t = d.elapsed_min;
+        if (!byTime.has(t)) byTime.set(t, []);
+        byTime.get(t).push(d[valueKey(denCh.rawKey, denCh.nbKey, d)]);
+      });
+    return [...byTime.entries()]
+      .map(([elapsed_min, vals]) => ({
+        elapsed_min: Number(elapsed_min),
+        value: meanFinite(vals),
+      }))
+      .filter(p => p.value !== null && p.value !== undefined && isFinite(p.value))
+      .sort((a, b) => a.elapsed_min - b.elapsed_min);
+  }
+
+  function formatRatioTitle(spec, groups = []) {
+    const mode = spec.useBckg ? 'Bckg-subtracted' : 'Raw';
+    const denVals = groups.flatMap(name => timeSeriesDenominatorPoints(name, spec).map(p => p.value));
+    if (!denVals.length) return `${spec.label} ratio - ${mode}`;
+    return `${spec.label} ratio - ${mode} (${spec.den} denom ${fmtVal(Math.min(...denVals))}-${fmtVal(Math.max(...denVals))})`;
+  }
+
+  function timeAxisRange() {
+    const times = analysisData
+      .map(d => d.elapsed_min)
+      .filter(v => v !== null && v !== undefined && isFinite(v));
+    if (!times.length) return null;
+    return {xMin: Math.min(...times), xMax: Math.max(...times)};
+  }
+
+  function plotValue(d, key) {
+    if (key === 'ratio') return ratioValue(d);
+    const ch = SUMMARY_CHANNELS.find(c => c.rawKey === key || c.nbKey === key || c.channel === key);
+    return ch ? channelPlotValue(d, ch) : d[key];
+  }
 
   function summaryYRange() {
     const allVals = SUMMARY_CHANNELS.flatMap(ch =>
-      analysisData.map(d => d[ch.key]).filter(v => v != null && isFinite(v))
+      analysisData.map(d => channelPlotValue(d, ch)).filter(v => v != null && isFinite(v))
     );
     if (!allVals.length) return {yMin: 0, yMax: 1};
     const gMin = Math.min(0, ...allVals), gMax = Math.max(0, ...allVals);
@@ -1957,14 +2926,36 @@ HTML_PAGE = """<!DOCTYPE html>
     return {yMin: gMin - pad, yMax: gMax + pad};
   }
 
+  function ratioYRange(useTimeSeries = false, seriesNames = []) {
+    const spec = ratioSpec();
+    const allVals = useTimeSeries
+      ? seriesNames.flatMap(name => timeSeriesRatioPoints(name, spec).map(p => p.value))
+      : analysisData.map(d => ratioValue(d)).filter(v => v != null && isFinite(v));
+    if (!allVals.length) return null;
+    const gMin = Math.min(...allVals), gMax = Math.max(...allVals);
+    const pad = (gMax - gMin) * 0.12 || Math.abs(gMax) * 0.12 || 0.1;
+    return {yMin: gMin - pad, yMax: gMax + pad};
+  }
+
   function renderSummary() {
     const empty = document.getElementById('summary-empty');
     const plots = document.getElementById('summary-plots');
+    const ratioPlot = document.getElementById('summary-ratio-plot');
     if (!analysisData.length) {
-      empty.style.display = ''; plots.style.display = 'none'; return;
+      empty.style.display = '';
+      plots.style.display = 'none';
+      if (ratioPlot) ratioPlot.style.display = 'none';
+      const orderControls = document.getElementById('summary-order-controls');
+      if (orderControls) orderControls.style.display = 'none';
+      return;
     }
-    empty.style.display = 'none'; plots.style.display = 'flex';
-    const groups = [...new Set(analysisData.map(summaryGroupKey))];
+    empty.style.display = 'none';
+    plots.style.display = 'flex';
+    const useTimeSeries = hasTimeSeriesData();
+    const groups = summaryGroups(useTimeSeries);
+    updateSummaryOrderControls(groups, useTimeSeries);
+    const showRatio = document.getElementById('summary-show-ratio')?.checked ?? false;
+    if (ratioPlot) ratioPlot.style.display = showRatio ? 'grid' : 'none';
     const {yMin, yMax} = summaryYRange();
     const plotsDiv = document.getElementById('summary-plots');
     const gap = 16;
@@ -1977,8 +2968,43 @@ HTML_PAGE = """<!DOCTYPE html>
       canvas.height = canvasH;
       canvas.style.width  = canvasW + 'px';
       canvas.style.height = canvasH + 'px';
-      drawBoxPlot(canvas, groups, ch.key, ch.color, ch.label, yMin, yMax, 'dark');
+      const title = channelPlotLabel(ch);
+      if (useTimeSeries) {
+        drawTimeSeriesPlot(canvas, groups, ch.channel, ch.color, title, yMin, yMax, 'dark');
+      } else {
+        drawBoxPlot(canvas, groups, ch.channel, ch.color, title, yMin, yMax, 'dark');
+      }
     });
+
+    const ratioRange = showRatio ? ratioYRange(useTimeSeries, groups) : null;
+    const ratioCanvas = document.getElementById('plot-ratio');
+    const ratioWrap = document.getElementById('summary-ratio-plot');
+    if (showRatio && ratioCanvas && ratioWrap) {
+      const ratioW = canvasW;
+      const ratioH = ratioWrap.clientHeight || 260;
+      ratioCanvas.width = ratioW;
+      ratioCanvas.height = ratioH;
+      ratioCanvas.style.width = ratioW + 'px';
+      ratioCanvas.style.height = ratioH + 'px';
+      const spec = ratioSpec();
+      const title = formatRatioTitle(spec, groups);
+      if (ratioRange) {
+        if (useTimeSeries) {
+          drawTimeSeriesPlot(ratioCanvas, groups, 'ratio', '#e7c84b', title, ratioRange.yMin, ratioRange.yMax, 'dark');
+        } else {
+          drawBoxPlot(ratioCanvas, groups, 'ratio', '#e7c84b', title, ratioRange.yMin, ratioRange.yMax, 'dark');
+        }
+      } else {
+        const ctx = ratioCanvas.getContext('2d');
+        ctx.clearRect(0, 0, ratioW, ratioH);
+        ctx.fillStyle = '#0b0f15';
+        ctx.fillRect(0, 0, ratioW, ratioH);
+        ctx.fillStyle = '#7090a8';
+        ctx.font = '12px IBM Plex Mono';
+        ctx.textAlign = 'center';
+        ctx.fillText('No finite normalized values for ' + spec.shortLabel, ratioW / 2, ratioH / 2);
+      }
+    }
   }
 
   function fmtVal(v) {
@@ -2007,7 +3033,7 @@ HTML_PAGE = """<!DOCTYPE html>
     ctx.fillStyle = bgCol; ctx.fillRect(0, 0, W, H);
 
     // determine Y range
-    const allVals = analysisData.map(d => d[key]).filter(v => v != null && isFinite(v));
+    const allVals = analysisData.map(d => plotValue(d, key)).filter(v => v != null && isFinite(v));
     if (!allVals.length) return;
     let yMin, yMax;
     if (yMinOverride !== null && yMaxOverride !== null) {
@@ -2059,7 +3085,7 @@ HTML_PAGE = """<!DOCTYPE html>
 
     const sampleData = samples.map(s => ({
       sample: s,
-      vals: analysisData.filter(d => summaryGroupKey(d) === s).map(d => d[key]).filter(v => v != null && isFinite(v)),
+      vals: analysisData.filter(d => summaryGroupKey(d) === s).map(d => plotValue(d, key)).filter(v => v != null && isFinite(v)),
     }));
     const stats = sampleData.map(sd => ({...sd, stats: computeStats(sd.vals)}));
 
@@ -2140,10 +3166,187 @@ HTML_PAGE = """<!DOCTYPE html>
   }
 
   // ── PDF export ──
+  function drawTimeSeriesPlot(canvas, seriesNames, key, color, title, yMinOverride = null, yMaxOverride = null, theme = 'dark') {
+    const ctx = canvas.getContext('2d');
+    const W = canvas.width, H = canvas.height;
+    ctx.clearRect(0, 0, W, H);
+
+    const isLight = theme === 'light';
+    const bgCol    = isLight ? '#ffffff' : '#0b0f15';
+    const gridCol  = isLight ? '#cccccc' : '#1e2d42';
+    const axisCol  = isLight ? '#666666' : '#2e4060';
+    const tickCol  = isLight ? '#333333' : '#7090a8';
+    const labelCol = isLight ? '#111111' : '#c8dff0';
+
+    ctx.fillStyle = bgCol;
+    ctx.fillRect(0, 0, W, H);
+
+    const values = key === 'ratio'
+      ? seriesNames.flatMap(name =>
+          timeSeriesRatioPoints(name).map(p => ({
+            elapsed_min: p.elapsed_min,
+            _plotValue: p.value,
+          }))
+        )
+      : analysisData
+          .map(d => ({...d, _plotValue: plotValue(d, key)}))
+          .filter(d =>
+            d.elapsed_min !== undefined && d.elapsed_min !== null && isFinite(d.elapsed_min) &&
+            d._plotValue !== null && d._plotValue !== undefined && isFinite(d._plotValue)
+          );
+    if (!values.length) return;
+
+    const sharedTimeRange = key === 'ratio' ? timeAxisRange() : null;
+    let xMin = sharedTimeRange ? sharedTimeRange.xMin : Math.min(...values.map(d => d.elapsed_min));
+    let xMax = sharedTimeRange ? sharedTimeRange.xMax : Math.max(...values.map(d => d.elapsed_min));
+    if (xMax === xMin) xMax = xMin + 1;
+
+    let yMin, yMax;
+    if (yMinOverride !== null && yMaxOverride !== null) {
+      yMin = yMinOverride;
+      yMax = yMaxOverride;
+    } else {
+      yMin = Math.min(...values.map(d => d._plotValue));
+      yMax = Math.max(...values.map(d => d._plotValue));
+      const pad = (yMax - yMin) * 0.12 || Math.abs(yMax) * 0.12 || 1;
+      yMin -= pad;
+      yMax += pad;
+    }
+
+    ctx.font = '13px IBM Plex Mono';
+    let maxLabelW = 0;
+    for (let t = 0; t <= 5; t++) {
+      const v = yMin + (yMax - yMin) * t / 5;
+      maxLabelW = Math.max(maxLabelW, ctx.measureText(fmtVal(v)).width);
+    }
+
+    const mg = {top: 86, right: 20, bottom: 56, left: Math.ceil(maxLabelW) + 20};
+    const pw = W - mg.left - mg.right;
+    const ph = H - mg.top - mg.bottom;
+    const toX = v => mg.left + (v - xMin) / (xMax - xMin) * pw;
+    const toY = v => mg.top + ph - (v - yMin) / (yMax - yMin) * ph;
+
+    ctx.fillStyle = color;
+    ctx.font = 'bold 15px IBM Plex Mono';
+    ctx.textAlign = 'center';
+    ctx.fillText(title + ' over time', W / 2, 26);
+
+    const legend = seriesNames.slice(0, 6);
+    ctx.font = '9px IBM Plex Mono';
+    ctx.textAlign = 'left';
+    let legendX = mg.left;
+    let legendY = 44;
+    legend.forEach((name, i) => {
+      const shortName = name.length > 18 ? name.slice(0, 17) + '...' : name;
+      const itemW = Math.min(150, ctx.measureText(shortName).width + 30);
+      if (legendX + itemW > W - mg.right) {
+        legendX = mg.left;
+        legendY += 12;
+      }
+      const lineCol = timeSeriesColor(i);
+      ctx.strokeStyle = lineCol;
+      ctx.lineWidth = 1.6;
+      ctx.beginPath();
+      ctx.moveTo(legendX, legendY - 3);
+      ctx.lineTo(legendX + 14, legendY - 3);
+      ctx.stroke();
+      ctx.fillStyle = lineCol;
+      ctx.fillText(shortName, legendX + 18, legendY);
+      legendX += itemW;
+    });
+
+    for (let t = 0; t <= 5; t++) {
+      const v = yMin + (yMax - yMin) * t / 5;
+      const y = toY(v);
+      ctx.strokeStyle = gridCol;
+      ctx.lineWidth = 0.5;
+      ctx.beginPath();
+      ctx.moveTo(mg.left, y);
+      ctx.lineTo(mg.left + pw, y);
+      ctx.stroke();
+      ctx.fillStyle = tickCol;
+      ctx.font = '13px IBM Plex Mono';
+      ctx.textAlign = 'right';
+      ctx.fillText(fmtVal(v), mg.left - 8, y + 5);
+    }
+
+    for (let t = 0; t <= 4; t++) {
+      const v = xMin + (xMax - xMin) * t / 4;
+      const x = toX(v);
+      ctx.strokeStyle = gridCol;
+      ctx.lineWidth = 0.5;
+      ctx.beginPath();
+      ctx.moveTo(x, mg.top);
+      ctx.lineTo(x, mg.top + ph);
+      ctx.stroke();
+      ctx.fillStyle = tickCol;
+      ctx.font = '12px IBM Plex Mono';
+      ctx.textAlign = 'center';
+      ctx.fillText(v.toFixed(v >= 10 ? 0 : 1), x, mg.top + ph + 20);
+    }
+
+    ctx.strokeStyle = axisCol;
+    ctx.lineWidth = 1.5;
+    ctx.beginPath();
+    ctx.moveTo(mg.left, mg.top);
+    ctx.lineTo(mg.left, mg.top + ph);
+    ctx.lineTo(mg.left + pw, mg.top + ph);
+    ctx.stroke();
+
+    ctx.fillStyle = labelCol;
+    ctx.font = '12px IBM Plex Mono';
+    ctx.textAlign = 'center';
+    ctx.fillText('Elapsed time (min)', mg.left + pw / 2, H - 12);
+
+    seriesNames.forEach((name, si) => {
+      let pts;
+      if (key === 'ratio') {
+        pts = timeSeriesRatioPoints(name);
+      } else {
+        const byTime = new Map();
+        values.filter(d => timeSeriesKey(d) === name).forEach(d => {
+          const t = d.elapsed_min;
+          if (!byTime.has(t)) byTime.set(t, []);
+          byTime.get(t).push(d._plotValue);
+        });
+        pts = [...byTime.entries()]
+          .map(([elapsed_min, vals]) => ({
+            elapsed_min: Number(elapsed_min),
+            value: vals.reduce((sum, v) => sum + v, 0) / vals.length,
+          }))
+          .sort((a, b) => a.elapsed_min - b.elapsed_min);
+      }
+      if (!pts.length) return;
+      const lineCol = timeSeriesColor(si);
+      ctx.strokeStyle = lineCol;
+      ctx.lineWidth = 1.8;
+      ctx.beginPath();
+      pts.forEach((p, pi) => {
+        const x = toX(p.elapsed_min);
+        const y = toY(p.value);
+        if (pi === 0) ctx.moveTo(x, y);
+        else ctx.lineTo(x, y);
+      });
+      ctx.stroke();
+      ctx.save();
+      ctx.globalAlpha = isLight ? 0.42 : 0.55;
+      pts.forEach(p => {
+        ctx.beginPath();
+        ctx.arc(toX(p.elapsed_min), toY(p.value), 4.2, 0, Math.PI * 2);
+        ctx.fillStyle = lineCol;
+        ctx.fill();
+      });
+      ctx.restore();
+    });
+
+  }
+
   async function exportSummaryPDF() {
     if (!analysisData.length) { setStatus('No data to export', 'wrn'); return; }
     if (!window.jspdf) { setStatus('PDF library not loaded', 'wrn'); return; }
-    const groups = [...new Set(analysisData.map(summaryGroupKey))];
+    const useTimeSeries = hasTimeSeriesData();
+    const groups = summaryGroups(useTimeSeries);
+    const showRatio = document.getElementById('summary-show-ratio')?.checked ?? false;
     const {yMin, yMax} = summaryYRange();
 
     // Canvas sized to match the per-plot slot on landscape A4 (3 plots, 8mm margins)
@@ -2152,7 +3355,12 @@ HTML_PAGE = """<!DOCTYPE html>
     const dataURLs = SUMMARY_CHANNELS.map(ch => {
       const c = document.createElement('canvas');
       c.width = CW; c.height = CH;
-      drawBoxPlot(c, groups, ch.key, ch.colorExport, ch.label, yMin, yMax, 'light');
+      const title = channelPlotLabel(ch);
+      if (useTimeSeries) {
+        drawTimeSeriesPlot(c, groups, ch.channel, ch.colorExport, title, yMin, yMax, 'light');
+      } else {
+        drawBoxPlot(c, groups, ch.channel, ch.colorExport, title, yMin, yMax, 'light');
+      }
       return c.toDataURL('image/png');
     });
 
@@ -2168,6 +3376,25 @@ HTML_PAGE = """<!DOCTYPE html>
     dataURLs.forEach((url, i) => {
       pdf.addImage(url, 'PNG', margin + i * (plotW + margin), yOff, plotW, plotH);
     });
+
+    const ratioRange = showRatio ? ratioYRange(useTimeSeries, groups) : null;
+    if (ratioRange) {
+      const spec = ratioSpec();
+      const ratioCanvas = document.createElement('canvas');
+      ratioCanvas.width = 1440;
+      ratioCanvas.height = 810;
+      const ratioTitle = formatRatioTitle(spec, groups);
+      if (useTimeSeries) {
+        drawTimeSeriesPlot(ratioCanvas, groups, 'ratio', '#9a7200', ratioTitle, ratioRange.yMin, ratioRange.yMax, 'light');
+      } else {
+        drawBoxPlot(ratioCanvas, groups, 'ratio', '#9a7200', ratioTitle, ratioRange.yMin, ratioRange.yMax, 'light');
+      }
+      const ratioUrl = ratioCanvas.toDataURL('image/png');
+      pdf.addPage('a4', 'landscape');
+      const ratioW = PW - margin * 2;
+      const ratioH = ratioW * ratioCanvas.height / ratioCanvas.width;
+      pdf.addImage(ratioUrl, 'PNG', margin, (PH - ratioH) / 2, ratioW, ratioH);
+    }
 
     const pdfDataUrl = pdf.output('datauristring');
     if (lastSaveDir) {
@@ -2232,21 +3459,11 @@ HTML_PAGE = """<!DOCTYPE html>
   }
 
   function drawRoisOnCtx(ctx, sx, sy) {
-    sortRois();
     rois.forEach((roi, i) => {
       const color = ROI_COLORS[i % ROI_COLORS.length];
       const label = getRoiLabel(roi, i);
       const x = roi.x*sx, y = roi.y*sy, w = roi.w*sx, h = roi.h*sy;
-      ctx.strokeStyle = color; ctx.lineWidth = 1.5;
-      ctx.fillStyle = color + '22';
-      if ((roi.shape||'rect') === 'circle') {
-        ctx.beginPath(); ctx.ellipse(x+w/2, y+h/2, w/2, h/2, 0, 0, Math.PI*2);
-        ctx.stroke(); ctx.fill();
-      } else {
-        ctx.strokeRect(x, y, w, h); ctx.fillRect(x, y, w, h);
-      }
-      ctx.fillStyle = color; ctx.font = 'bold 11px IBM Plex Mono';
-      ctx.fillText(label, x+4, y+13);
+      drawSingleRoi(ctx, x, y, w, h, roi.shape||'rect', color, false, label);
     });
   }
 
@@ -2268,8 +3485,11 @@ HTML_PAGE = """<!DOCTYPE html>
       x: r.x * scaleX, y: r.y * scaleY,
       w: r.w * scaleX, h: r.h * scaleY,
     }));
+    ensureRoiNumbers();
     selectedRoi = -1;
+    renderRoiSetupTable();
     drawAll();
+    scheduleRoiAutosave();
     setStatus(`Loaded ${rois.length} ROIs from ${saved.stem}`, 'ok');
   }
 </script>
@@ -2280,7 +3500,7 @@ HTML_PAGE = """<!DOCTYPE html>
 
 if __name__ == "__main__":
     print()
-    print("  Biolum Analysis Tool")
+    print("  Biolum Analyzer")
     print("  ─────────────────────────────────────────")
     print("  Opening browser at http://localhost:5001")
     print("  Press Ctrl+C to quit")
